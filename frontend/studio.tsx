@@ -1,11 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import * as Tone from "tone";
 import Logo from './components/Logo';
 import { generateWaveform } from './utils/waveform';
 
 // --- CONSTANTS ---
-const PX_PER_SEC = 50; 
+const PX_PER_SEC = 50;
 const SNAP_GRID = 0.25; // Snap to quarter notes
 
 interface Clip {
@@ -29,17 +29,26 @@ interface Track {
     clips: Clip[];
 }
 
+interface ProjectSummary {
+    id: number;
+    title: string;
+    bpm: number;
+    last_updated: string;
+}
+
 export default function Studio() {
     const navigate = useNavigate();
     const { id } = useParams();
     const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
-    // --- GLOBAL LAYOUT STATE ---
+    // --- GLOBAL STATE ---
     const [activeTab, setActiveTab] = useState<'create' | 'upload'>('create');
     const [loading, setLoading] = useState(true);
     const [projectTitle, setProjectTitle] = useState("Untitled Project");
     const [projectId, setProjectId] = useState<number | null>(null);
     const [isSaving, setIsSaving] = useState(false);
+    const [showLoadModal, setShowLoadModal] = useState(false);
+    const [savedProjects, setSavedProjects] = useState<ProjectSummary[]>([]);
 
     // --- DAW STATE ---
     const [tracks, setTracks] = useState<Track[]>([
@@ -52,21 +61,21 @@ export default function Studio() {
     const [bpm, setBpm] = useState(120);
     const [currentTime, setCurrentTime] = useState(0);
     const [isRecording, setIsRecording] = useState(false);
-    
-    // --- DRAG & DROP STATE ---
+
+    // --- DRAG & DROP STATE (VISUAL ONLY - Prevents Render Loop Bug) ---
     const [dragState, setDragState] = useState<{
         type: 'MOVE' | 'RESIZE_L' | 'RESIZE_R';
         clipId: string;
-        trackId: string;
+        fromTrackId: string;
         startX: number;
+        currentX: number;
+        currentY: number;
         originalStart: number;
         originalDuration: number;
     } | null>(null);
 
-    // --- UPLOAD TAB STATE ---
-    const [uploadForm, setUploadForm] = useState({
-        title: "", genre: "", bpm: "", price: "", description: "", tags: ""
-    });
+    // --- UPLOAD STATE ---
+    const [uploadForm, setUploadForm] = useState({ title: "", genre: "", bpm: "", price: "", description: "", tags: "" });
     const [audioFile, setAudioFile] = useState<File | null>(null);
     const [coverArt, setCoverArt] = useState<File | null>(null);
     const [isUploading, setIsUploading] = useState(false);
@@ -79,18 +88,26 @@ export default function Studio() {
     const animationFrameRef = useRef<number | null>(null);
     const timelineRef = useRef<HTMLDivElement>(null);
 
-    // --- AUTHENTICATION CHECK ---
+    // --- 1. INITIALIZATION & AUTH ---
     useEffect(() => {
+        const initEngine = async () => {
+            micRef.current = new Tone.UserMedia();
+            recorderRef.current = new Tone.Recorder();
+            micRef.current.connect(recorderRef.current);
+        };
+        initEngine();
+
+        // Check Auth
         const checkAuth = async () => {
-            const accessToken = localStorage.getItem('accessToken');
-            if (!accessToken) {
+            const token = localStorage.getItem('accessToken');
+            if (!token) {
                 navigate('/login');
                 return;
             }
 
             try {
                 const res = await fetch(`${API_BASE_URL}/api/auth/profile/`, {
-                    headers: { 'Authorization': `Bearer ${accessToken}` }
+                    headers: { 'Authorization': `Bearer ${token}` }
                 });
 
                 if (!res.ok) {
@@ -112,71 +129,9 @@ export default function Studio() {
                 navigate('/login');
             }
         };
-
         checkAuth();
-    }, [navigate, API_BASE_URL, id]);
 
-    // --- LOAD EXISTING PROJECT ---
-    useEffect(() => {
-        const loadProject = async () => {
-            if (!id) return;
-
-            const accessToken = localStorage.getItem('accessToken');
-            if (!accessToken) return;
-
-            try {
-                const res = await fetch(`${API_BASE_URL}/api/music/projects/${id}/`, {
-                    headers: { 'Authorization': `Bearer ${accessToken}` }
-                });
-
-                if (res.ok) {
-                    const project = await res.json();
-                    setProjectId(project.id);
-                    setProjectTitle(project.title || "Untitled Project");
-                    setBpm(project.bpm || 120);
-
-                    if (project.arrangement_json?.tracks) {
-                        const loadedTracks = project.arrangement_json.tracks.map((t: Track) => ({
-                            ...t,
-                            isSolo: t.isSolo ?? false,
-                            volume: t.volume ?? 0,
-                            pan: t.pan ?? 0
-                        }));
-                        setTracks(loadedTracks);
-                        
-                        // Generate waveforms for loaded clips
-                        for (const track of loadedTracks) {
-                            for (const clip of track.clips) {
-                                if (!clip.waveformData && clip.url) {
-                                    generateWaveform(clip.url, 100).then(waveData => {
-                                        setTracks(prev => prev.map(t => ({
-                                            ...t,
-                                            clips: t.clips.map(c => 
-                                                c.id === clip.id ? { ...c, waveformData: waveData } : c
-                                            )
-                                        })));
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (error) {
-                console.error("Failed to load project:", error);
-            } finally {
-                setLoading(false);
-            }
-        };
-
-        loadProject();
-    }, [id, API_BASE_URL]);
-
-    // --- INITIALIZATION ---
-    useEffect(() => {
-        micRef.current = new Tone.UserMedia();
-        recorderRef.current = new Tone.Recorder();
-        micRef.current.connect(recorderRef.current);
-
+        // Clean up
         return () => {
             micRef.current?.dispose();
             recorderRef.current?.dispose();
@@ -184,61 +139,116 @@ export default function Studio() {
             channelsRef.current.forEach(c => c.dispose());
             if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
         };
-    }, []);
+    }, [navigate, API_BASE_URL, id]);
 
-    // --- AUDIO SYNC & PLAYBACK ---
+    // --- 2. LOAD PROJECT LOGIC ---
+    useEffect(() => {
+        if (!id) return;
+        const loadProject = async () => {
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/music/projects/${id}/`, {
+                    headers: { 'Authorization': `Bearer ${localStorage.getItem('accessToken')}` }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    setProjectId(data.id);
+                    setProjectTitle(data.title);
+                    setBpm(data.bpm);
+                    if (data.arrangement_json?.tracks) {
+                        const loadedTracks = data.arrangement_json.tracks.map((t: Track) => ({
+                            ...t,
+                            isSolo: t.isSolo ?? false,
+                            volume: t.volume ?? 0,
+                            pan: t.pan ?? 0
+                        }));
+                        setTracks(loadedTracks);
+                        
+                        // Re-generate waveforms if missing
+                        for (const track of loadedTracks) {
+                            for (const clip of track.clips) {
+                                if (!clip.waveformData && clip.url) {
+                                    generateWaveform(clip.url, 100).then(wd => {
+                                        setTracks(prev => prev.map(pt => ({
+                                            ...pt,
+                                            clips: pt.clips.map(pc => pc.id === clip.id ? { ...pc, waveformData: wd } : pc)
+                                        })));
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (err) { 
+                console.error("Load failed", err); 
+            } finally {
+                setLoading(false);
+            }
+        };
+        loadProject();
+    }, [id, API_BASE_URL]);
+
+    const fetchProjectList = async () => {
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/music/projects/`, {
+                headers: { 'Authorization': `Bearer ${localStorage.getItem('accessToken')}` }
+            });
+            if (res.ok) setSavedProjects(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    // --- 3. AUDIO ENGINE SYNC (Core Logic - Only updates on state commit) ---
     useEffect(() => {
         Tone.Transport.bpm.value = bpm;
 
         tracks.forEach(track => {
-            // Create Channel (Mixer Strip)
+            // A. Create/Update Channel (Volume/Pan)
             if (!channelsRef.current.has(track.id)) {
-                const channel = new Tone.Channel({
-                    volume: track.volume,
-                    pan: track.pan,
-                    mute: track.isMuted,
-                    solo: track.isSolo
-                }).toDestination();
+                const channel = new Tone.Channel({ volume: track.volume, pan: track.pan, mute: track.isMuted, solo: track.isSolo }).toDestination();
                 channelsRef.current.set(track.id, channel);
             }
-            
-            // Update Channel Settings
-            const channel = channelsRef.current.get(track.id);
-            if (channel) {
-                channel.volume.rampTo(track.volume, 0.1);
-                channel.pan.rampTo(track.pan, 0.1);
-                channel.mute = track.isMuted;
-                channel.solo = track.isSolo;
-            }
+            const channel = channelsRef.current.get(track.id)!;
+            channel.volume.rampTo(track.volume, 0.1);
+            channel.pan.rampTo(track.pan, 0.1);
+            channel.mute = track.isMuted;
+            channel.solo = track.isSolo;
 
-            // Sync Clips (Players)
+            // B. Sync Players
             track.clips.forEach(clip => {
                 if (!playersRef.current.has(clip.id)) {
-                    const player = new Tone.Player(clip.url);
-                    player.connect(channel!);
-                    player.sync().start(clip.startTime).stop(clip.startTime + clip.duration);
+                    const player = new Tone.Player({
+                        url: clip.url,
+                        onload: () => {
+                            player.sync().start(clip.startTime).stop(clip.startTime + clip.duration);
+                        }
+                    }).connect(channel);
                     playersRef.current.set(clip.id, player);
                 } else {
-                    const player = playersRef.current.get(clip.id);
-                    if (player) {
-                        if (player.state === 'started') player.stop();
-                        player.unsync();
-                        player.sync().start(clip.startTime).stop(clip.startTime + clip.duration);
+                    const player = playersRef.current.get(clip.id)!;
+                    if (player.state !== "started") {
+                        try {
+                            player.unsync();
+                            player.sync().start(clip.startTime).stop(clip.startTime + clip.duration);
+                        } catch (e) {
+                            // Clip might be disposed or invalid
+                        }
                     }
                 }
             });
         });
     }, [tracks, bpm]);
 
+    // --- 4. PLAYBACK CONTROLS ---
     const handlePlay = async () => {
         await Tone.start();
+        await Tone.loaded();
+        
         if (isPlaying) {
             Tone.Transport.pause();
             setIsPlaying(false);
         } else {
             Tone.Transport.start();
             setIsPlaying(true);
-            updatePlayhead();
+            requestAnimationFrame(updatePlayhead);
         }
     };
 
@@ -246,6 +256,7 @@ export default function Studio() {
         Tone.Transport.stop();
         setIsPlaying(false);
         setCurrentTime(0);
+        playersRef.current.forEach(p => p.stop());
     };
 
     const updatePlayhead = () => {
@@ -255,16 +266,20 @@ export default function Studio() {
         }
     };
 
-    // --- DRAG, RESIZE LOGIC ---
+    // --- 5. DRAG & DROP HANDLERS (VISUAL ONLY - Prevents 60fps re-renders) ---
     const handleMouseMove = (e: React.MouseEvent) => {
         if (!dragState) return;
-        
-        const deltaPixels = e.clientX - dragState.startX;
-        const deltaTime = deltaPixels / PX_PER_SEC;
+        setDragState(prev => prev ? { ...prev, currentX: e.clientX, currentY: e.clientY } : null);
+    };
 
-        setTracks(prev => prev.map(track => {
-            if (track.id !== dragState.trackId) return track;
-            
+    const handleMouseUp = () => {
+        if (!dragState) return;
+
+        const deltaPixels = dragState.currentX - dragState.startX;
+        const deltaTime = deltaPixels / PX_PER_SEC;
+        
+        const newTracks = tracks.map(track => {
+            if (track.id !== dragState.fromTrackId) return track;
             return {
                 ...track,
                 clips: track.clips.map(clip => {
@@ -282,44 +297,30 @@ export default function Studio() {
                     return clip;
                 })
             };
-        }));
-    };
+        });
 
-    const handleMouseUp = () => {
+        setTracks(newTracks);
         setDragState(null);
     };
 
-    // --- DELETE LOGIC ---
-    useEffect(() => {
-        const handleKeyDown = (e: KeyboardEvent) => {
-            if ((e.key === 'Backspace' || e.key === 'Delete') && selectedClipId) {
-                // Revoke blob URL to free memory
-                for (const track of tracks) {
-                    const clip = track.clips.find(c => c.id === selectedClipId);
-                    if (clip && clip.url.startsWith('blob:')) {
-                        URL.revokeObjectURL(clip.url);
-                    }
-                }
-                
-                // Dispose player
-                const player = playersRef.current.get(selectedClipId);
-                if (player) {
-                    player.dispose();
-                    playersRef.current.delete(selectedClipId);
-                }
+    // Helper to render clips with visual drag position
+    const getRenderStyle = (clip: Clip) => {
+        let left = clip.startTime * PX_PER_SEC;
+        let width = clip.duration * PX_PER_SEC;
 
-                setTracks(prev => prev.map(t => ({
-                    ...t,
-                    clips: t.clips.filter(c => c.id !== selectedClipId)
-                })));
-                setSelectedClipId(null);
+        if (dragState && dragState.clipId === clip.id) {
+            const deltaPixels = dragState.currentX - dragState.startX;
+            if (dragState.type === 'MOVE') {
+                left += deltaPixels;
+            } else if (dragState.type === 'RESIZE_R') {
+                width += deltaPixels;
             }
-        };
-        window.addEventListener('keydown', handleKeyDown);
-        return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedClipId, tracks]);
+        }
 
-    // --- RECORDING LOGIC ---
+        return { left: `${left}px`, width: `${Math.max(5, width)}px` };
+    };
+
+    // --- 6. RECORDING ---
     const handleRecord = async () => {
         if (isRecording) {
             const blob = await recorderRef.current?.stop();
@@ -337,7 +338,6 @@ export default function Studio() {
                     waveformData: waveData,
                     color: "bg-red-500"
                 };
-
                 setTracks(prev => prev.map(t => t.id === selectedTrackId ? { ...t, clips: [...t.clips, newClip] } : t));
             }
             setIsPlaying(false);
@@ -350,11 +350,11 @@ export default function Studio() {
             Tone.Transport.start();
             setIsPlaying(true);
             setIsRecording(true);
-            updatePlayhead();
+            requestAnimationFrame(updatePlayhead);
         }
     };
 
-    // --- IMPORT AUDIO ---
+    // --- 7. IMPORT AUDIO ---
     const handleImportAudio = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
@@ -374,42 +374,13 @@ export default function Studio() {
         };
 
         setTracks(prev => prev.map(t =>
-            t.id === selectedTrackId
-                ? { ...t, clips: [...t.clips, newClip] }
-                : t
+            t.id === selectedTrackId ? { ...t, clips: [...t.clips, newClip] } : t
         ));
 
         e.target.value = '';
     };
 
-    // --- CLEAR ALL ---
-    const clearAll = () => {
-        Tone.Transport.stop();
-        setIsPlaying(false);
-        setIsRecording(false);
-        
-        // Revoke blob URLs
-        tracks.forEach(track => {
-            track.clips.forEach(clip => {
-                if (clip.url.startsWith('blob:')) {
-                    URL.revokeObjectURL(clip.url);
-                }
-            });
-        });
-        
-        // Dispose players
-        playersRef.current.forEach(p => p.dispose());
-        playersRef.current.clear();
-        
-        setTracks([
-            { id: "1", name: "Beat", isMuted: false, isSolo: false, volume: -6, pan: 0, clips: [] },
-            { id: "2", name: "Vocals", isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }
-        ]);
-        setCurrentTime(0);
-        setSelectedClipId(null);
-    };
-
-    // --- SAVE PROJECT ---
+    // --- 8. SAVE PROJECT ---
     const saveProject = async () => {
         const accessToken = localStorage.getItem('accessToken');
         if (!accessToken) {
@@ -502,7 +473,57 @@ export default function Studio() {
         }
     };
 
-    // --- UPLOAD HANDLER ---
+    // --- 9. CLEAR ALL ---
+    const clearAll = () => {
+        Tone.Transport.stop();
+        setIsPlaying(false);
+        setIsRecording(false);
+        
+        tracks.forEach(track => {
+            track.clips.forEach(clip => {
+                if (clip.url.startsWith('blob:')) {
+                    URL.revokeObjectURL(clip.url);
+                }
+            });
+        });
+        
+        playersRef.current.forEach(p => p.dispose());
+        playersRef.current.clear();
+        
+        setTracks([
+            { id: "1", name: "Beat", isMuted: false, isSolo: false, volume: -6, pan: 0, clips: [] },
+            { id: "2", name: "Vocals", isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }
+        ]);
+        setCurrentTime(0);
+        setSelectedClipId(null);
+    };
+
+    // --- 10. DELETE KEY ---
+    useEffect(() => {
+        const handleKey = (e: KeyboardEvent) => {
+            if ((e.key === 'Delete' || e.key === 'Backspace') && selectedClipId) {
+                // Revoke blob URL
+                for (const track of tracks) {
+                    const clip = track.clips.find(c => c.id === selectedClipId);
+                    if (clip && clip.url.startsWith('blob:')) {
+                        URL.revokeObjectURL(clip.url);
+                    }
+                }
+                
+                // Dispose player
+                const player = playersRef.current.get(selectedClipId);
+                player?.dispose();
+                playersRef.current.delete(selectedClipId);
+                
+                setTracks(prev => prev.map(t => ({...t, clips: t.clips.filter(c => c.id !== selectedClipId)})));
+                setSelectedClipId(null);
+            }
+        };
+        window.addEventListener('keydown', handleKey);
+        return () => window.removeEventListener('keydown', handleKey);
+    }, [selectedClipId, tracks]);
+
+    // --- 11. UPLOAD HANDLER ---
     const handleUploadSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         const accessToken = localStorage.getItem('accessToken');
@@ -558,7 +579,7 @@ export default function Studio() {
 
     if (loading) {
         return (
-            <div className="min-h-screen bg-black flex items-center justify-center">
+            <div className="min-h-screen bg-[#121214] flex items-center justify-center">
                 <div className="w-8 h-8 border-2 border-purple-500 rounded-full animate-spin border-t-transparent"></div>
             </div>
         );
@@ -566,131 +587,163 @@ export default function Studio() {
 
     return (
         <div 
-            className="flex flex-col h-screen bg-gray-950 text-white font-sans overflow-hidden"
+            className="flex flex-col h-screen bg-[#121214] text-white font-sans overflow-hidden select-none"
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
         >
-            {/* --- HEADER / TAB SWITCHER --- */}
-            <div className="h-16 bg-gray-900 border-b border-gray-800 flex items-center justify-between px-6 z-20">
-                <div className="flex items-center gap-4">
-                    <Link to="/"><Logo size="sm" showText={false} /></Link>
-                    <div className="flex bg-black/30 rounded-lg p-1">
-                        <button 
-                            onClick={() => setActiveTab('create')}
-                            className={`px-4 py-1.5 rounded-md text-sm font-bold transition-all ${activeTab === 'create' ? 'bg-gray-700 text-white shadow' : 'text-gray-400 hover:text-white'}`}
-                        >
-                            🎹 Studio
-                        </button>
-                        <button 
-                            onClick={() => setActiveTab('upload')}
-                            className={`px-4 py-1.5 rounded-md text-sm font-bold transition-all ${activeTab === 'upload' ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
-                        >
-                            ☁️ Upload
-                        </button>
+            {/* --- LOAD PROJECT MODAL --- */}
+            {showLoadModal && (
+                <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+                    <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-md p-6">
+                        <h3 className="text-xl font-bold mb-4">Open Project</h3>
+                        <div className="max-h-60 overflow-y-auto space-y-2 mb-4">
+                            {savedProjects.length === 0 && <p className="text-gray-500">No projects found.</p>}
+                            {savedProjects.map(p => (
+                                <div key={p.id} onClick={() => { navigate(`/studio/${p.id}`); setShowLoadModal(false); }}
+                                    className="p-3 bg-gray-800 hover:bg-gray-700 rounded cursor-pointer flex justify-between items-center"
+                                >
+                                    <span>{p.title}</span>
+                                    <span className="text-xs text-gray-500">{p.bpm} BPM</span>
+                                </div>
+                            ))}
+                        </div>
+                        <button onClick={() => setShowLoadModal(false)} className="w-full py-2 bg-gray-700 hover:bg-gray-600 rounded">Close</button>
                     </div>
                 </div>
+            )}
 
-                {/* TRANSPORT CONTROLS (Only visible in Create) */}
+            {/* --- HEADER --- */}
+            <div className="h-14 bg-[#18181b] border-b border-white/5 flex items-center justify-between px-4 z-20">
+                <div className="flex items-center gap-4">
+                    <Link to="/" className="opacity-80 hover:opacity-100"><Logo size="sm" showText={false} /></Link>
+                    
+                    {/* View Switcher */}
+                    <div className="flex bg-black/40 rounded-lg p-1">
+                        <button onClick={() => setActiveTab('create')} className={`px-4 py-1 rounded text-xs font-bold ${activeTab === 'create' ? 'bg-gray-700 text-white' : 'text-gray-400'}`}>Studio</button>
+                        <button onClick={() => setActiveTab('upload')} className={`px-4 py-1 rounded text-xs font-bold ${activeTab === 'upload' ? 'bg-blue-600 text-white' : 'text-gray-400'}`}>Upload</button>
+                    </div>
+
+                    {/* File Menu */}
+                    {activeTab === 'create' && (
+                        <>
+                            <div className="h-6 w-[1px] bg-white/10 mx-2"></div>
+                            <button onClick={() => { fetchProjectList(); setShowLoadModal(true); }} className="text-xs text-gray-300 hover:text-white flex items-center gap-1">📂 Open</button>
+                            <button onClick={saveProject} disabled={isSaving} className="text-xs text-gray-300 hover:text-white flex items-center gap-1">
+                                {isSaving ? "..." : "💾 Save"}
+                            </button>
+                            <label className="text-xs text-gray-300 hover:text-white flex items-center gap-1 cursor-pointer">
+                                📁 Import
+                                <input type="file" accept="audio/*" onChange={handleImportAudio} className="hidden" />
+                            </label>
+                            <button onClick={clearAll} className="text-xs text-gray-300 hover:text-white">🗑 Clear</button>
+                        </>
+                    )}
+                </div>
+
+                {/* TRANSPORT BAR (Center) */}
                 {activeTab === 'create' && (
-                    <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-6 absolute left-1/2 -translate-x-1/2">
                         {/* Project Title */}
                         <input
                             type="text"
                             value={projectTitle}
                             onChange={(e) => setProjectTitle(e.target.value)}
-                            className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-white w-40 text-sm focus:outline-none focus:border-purple-500"
+                            className="bg-transparent border-b border-transparent hover:border-white/20 focus:border-white/40 px-2 py-1 text-sm font-medium text-center w-40 focus:outline-none"
                             placeholder="Project Name"
                         />
 
-                        <div className="flex items-center bg-gray-800 rounded-lg p-1">
-                            <button onClick={handleStop} className="w-10 h-8 flex items-center justify-center hover:bg-gray-700 rounded" title="Stop">⏹</button>
-                            <button onClick={handlePlay} className={`w-12 h-8 flex items-center justify-center rounded font-bold ${isPlaying ? 'bg-green-500/20 text-green-500' : 'hover:bg-gray-700'}`} title="Play/Pause">
-                                {isPlaying ? '⏸' : '▶'}
+                        {/* Main Controls */}
+                        <div className="flex items-center gap-2">
+                            <button onClick={handleStop} className="w-8 h-8 flex items-center justify-center bg-gray-800 rounded hover:bg-gray-700 transition" title="Stop">
+                                <div className="w-3 h-3 bg-gray-400 rounded-sm"></div>
                             </button>
-                            <button onClick={handleRecord} className={`w-10 h-8 flex items-center justify-center rounded ${isRecording ? 'text-red-500 animate-pulse' : 'hover:bg-gray-700 text-red-500'}`} title="Record">●</button>
+                            <button 
+                                onClick={handlePlay} 
+                                className={`w-10 h-10 flex items-center justify-center rounded-full transition shadow-lg ${isPlaying ? 'bg-green-500/20 text-green-500 ring-1 ring-green-500' : 'bg-white/10 text-white hover:bg-white/20'}`}
+                                title="Play/Pause"
+                            >
+                                {isPlaying ? (
+                                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                                ) : (
+                                    <svg className="w-4 h-4 fill-current ml-0.5" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                )}
+                            </button>
+                            <button 
+                                onClick={handleRecord} 
+                                className={`w-8 h-8 flex items-center justify-center rounded hover:bg-gray-700 transition ${isRecording ? 'text-red-500 bg-red-500/10 ring-1 ring-red-500' : 'text-red-600'}`}
+                                title="Record"
+                            >
+                                <div className={`w-3 h-3 rounded-full bg-current ${isRecording ? 'animate-pulse' : ''}`}></div>
+                            </button>
                         </div>
 
-                        <div className="flex items-center gap-2 bg-gray-800 px-3 py-1.5 rounded-lg border border-gray-700">
-                            <span className="text-xs text-gray-400">BPM</span>
-                            <input type="number" value={bpm} onChange={e => setBpm(Number(e.target.value))} className="w-12 bg-transparent text-center font-mono outline-none" min={40} max={300} />
+                        {/* Display */}
+                        <div className="bg-black/40 px-4 py-1.5 rounded-lg border border-white/5 flex items-center gap-4">
+                            <div className="flex flex-col items-center leading-none">
+                                <span className="text-[10px] text-gray-500 font-bold tracking-wider">BPM</span>
+                                <input type="number" value={bpm} onChange={e => setBpm(Number(e.target.value))} className="w-10 bg-transparent text-center text-sm font-mono text-blue-400 focus:outline-none" min={40} max={300} />
+                            </div>
+                            <div className="w-[1px] h-6 bg-white/10"></div>
+                            <div className="flex flex-col items-center leading-none w-20">
+                                <span className="text-[10px] text-gray-500 font-bold tracking-wider">TIME</span>
+                                <span className="text-sm font-mono text-green-400">{formatTime(currentTime)}</span>
+                            </div>
                         </div>
-
-                        <div className="font-mono text-lg w-28 text-center bg-gray-800 px-3 py-1.5 rounded-lg">
-                            {formatTime(currentTime)}
-                        </div>
-
-                        {/* Import */}
-                        <label className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium cursor-pointer transition-colors">
-                            📁 Import
-                            <input type="file" accept="audio/*" onChange={handleImportAudio} className="hidden" />
-                        </label>
-
-                        {/* Save */}
-                        <button onClick={saveProject} disabled={isSaving} className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
-                            {isSaving ? "..." : "💾 Save"}
-                        </button>
-
-                        {/* Clear */}
-                        <button onClick={clearAll} className="px-3 py-1.5 bg-white/5 hover:bg-white/10 rounded-lg text-sm text-gray-400 hover:text-white transition-colors">
-                            🗑
-                        </button>
                     </div>
                 )}
-                
-                <div className="w-20"></div>
+
+                <div className="w-32"></div>
             </div>
 
-            {/* --- MAIN WORKSPACE --- */}
+            {/* --- WORKSPACE --- */}
             {activeTab === 'create' ? (
                 <div className="flex-1 flex overflow-hidden">
-                    {/* TRACK HEADERS (Left) */}
-                    <div className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col z-10 overflow-y-auto">
+                    {/* LEFT SIDEBAR (Tracks) */}
+                    <div className="w-64 bg-[#18181b] border-r border-white/5 flex flex-col z-10 overflow-y-auto">
                         {tracks.map(track => (
                             <div 
-                                key={track.id} 
-                                onClick={() => setSelectedTrackId(track.id)}
-                                className={`h-28 border-b border-gray-800 p-3 flex flex-col justify-between cursor-pointer transition-colors ${
-                                    selectedTrackId === track.id ? 'bg-purple-900/30 border-l-4 border-l-purple-500' : 'bg-gray-800/50 hover:bg-gray-800'
-                                }`}
+                                key={track.id}
+                                onClick={() => setSelectedTrackId(track.id)} 
+                                className={`h-32 border-b border-white/5 p-3 flex flex-col justify-between transition-colors cursor-pointer ${selectedTrackId === track.id ? 'bg-white/5 border-l-2 border-l-purple-500' : 'hover:bg-white/5'}`}
                             >
-                                <div className="flex justify-between items-start">
+                                <div className="flex justify-between items-center mb-1">
                                     <input 
                                         value={track.name} 
-                                        onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? { ...t, name: e.target.value } : t))}
+                                        onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? { ...t, name: e.target.value } : t))} 
                                         onClick={e => e.stopPropagation()}
-                                        className="bg-transparent font-bold w-24 focus:outline-none" 
+                                        className="bg-transparent font-bold text-sm w-24 focus:outline-none focus:bg-black/50 rounded px-1" 
                                     />
                                     <div className="flex gap-1">
                                         <button 
                                             onClick={(e) => { e.stopPropagation(); setTracks(prev => prev.map(t => t.id === track.id ? {...t, isMuted: !t.isMuted} : t)); }} 
-                                            className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${track.isMuted ? 'bg-red-500' : 'bg-gray-700 hover:bg-gray-600'}`}
+                                            className={`w-5 h-5 text-[10px] rounded flex items-center justify-center font-bold ${track.isMuted ? 'bg-red-500 text-white' : 'bg-[#27272a] text-gray-400 hover:bg-gray-600'}`}
                                         >M</button>
                                         <button 
                                             onClick={(e) => { e.stopPropagation(); setTracks(prev => prev.map(t => t.id === track.id ? {...t, isSolo: !t.isSolo} : t)); }} 
-                                            className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${track.isSolo ? 'bg-yellow-500 text-black' : 'bg-gray-700 hover:bg-gray-600'}`}
+                                            className={`w-5 h-5 text-[10px] rounded flex items-center justify-center font-bold ${track.isSolo ? 'bg-yellow-500 text-black' : 'bg-[#27272a] text-gray-400 hover:bg-gray-600'}`}
                                         >S</button>
                                     </div>
                                 </div>
-                                <div className="space-y-2">
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-[10px] text-gray-400 w-4">Vol</span>
+                                <div className="space-y-3">
+                                    <div className="flex items-center gap-2 group">
+                                        <span className="text-[9px] text-gray-500 w-6">VOL</span>
                                         <input 
                                             type="range" min="-60" max="25" value={track.volume} 
                                             onClick={e => e.stopPropagation()}
-                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? {...t, volume: Number(e.target.value)} : t))}
-                                            className="flex-1 h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-purple-500" 
+                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? {...t, volume: Number(e.target.value)} : t))} 
+                                            className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-500" 
                                         />
-                                        <span className="text-[10px] w-8 text-right">{track.volume}dB</span>
+                                        <span className="text-[9px] text-gray-400 w-8 text-right">{track.volume}dB</span>
                                     </div>
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-[10px] text-gray-400 w-4">Pan</span>
+                                    <div className="flex items-center gap-2 group">
+                                        <span className="text-[9px] text-gray-500 w-6">PAN</span>
                                         <input 
                                             type="range" min="-1" max="1" step="0.1" value={track.pan} 
                                             onClick={e => e.stopPropagation()}
-                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? {...t, pan: Number(e.target.value)} : t))}
-                                            className="flex-1 h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-purple-500" 
+                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? {...t, pan: Number(e.target.value)} : t))} 
+                                            className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-500" 
                                         />
-                                        <span className="text-[10px] w-8 text-right">
+                                        <span className="text-[9px] text-gray-400 w-8 text-right">
                                             {track.pan === 0 ? 'C' : track.pan < 0 ? `L${Math.abs(track.pan * 100).toFixed(0)}` : `R${(track.pan * 100).toFixed(0)}`}
                                         </span>
                                     </div>
@@ -698,110 +751,106 @@ export default function Studio() {
                             </div>
                         ))}
                         <button 
-                            onClick={() => setTracks([...tracks, { id: crypto.randomUUID(), name: "Track " + (tracks.length + 1), isMuted: false, isSolo: false, volume: -6, pan: 0, clips: [] }])} 
-                            className="p-3 text-sm text-gray-400 hover:bg-gray-800 hover:text-white text-left transition-colors"
+                            onClick={() => setTracks([...tracks, { id: crypto.randomUUID(), name: `Track ${tracks.length+1}`, isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }])} 
+                            className="p-4 text-xs font-bold text-gray-500 hover:text-white hover:bg-white/5 border-b border-white/5 transition-colors"
                         >
-                            + Add Track
+                            + ADD TRACK
                         </button>
                     </div>
 
-                    {/* TIMELINE (Right) */}
-                    <div className="flex-1 bg-gray-950 overflow-x-auto overflow-y-hidden relative" ref={timelineRef}>
+                    {/* RIGHT TIMELINE */}
+                    <div className="flex-1 bg-[#121214] overflow-x-auto overflow-y-hidden relative" ref={timelineRef}>
                         {/* Time Ruler */}
-                        <div className="h-6 bg-gray-900 border-b border-gray-800 sticky top-0 z-20 flex">
+                        <div className="h-8 bg-[#18181b] border-b border-white/5 sticky top-0 z-20 flex items-end pb-1 shadow-sm">
                             {Array.from({ length: 120 }).map((_, i) => (
-                                <div key={i} className="flex-shrink-0 border-l border-gray-700 text-[10px] text-gray-500 pl-1" style={{ width: `${PX_PER_SEC}px` }}>
-                                    {i}s
-                                </div>
+                                <div key={i} className="flex-shrink-0 border-l border-white/10 text-[9px] text-gray-500 pl-1 select-none" style={{ width: `${PX_PER_SEC}px` }}>{i}s</div>
                             ))}
                         </div>
 
                         {/* Playhead */}
-                        <div className="absolute top-0 bottom-0 w-[2px] bg-red-500 z-30 pointer-events-none" style={{ left: `${currentTime * PX_PER_SEC}px` }}>
-                            <div className="w-3 h-3 bg-red-500 -ml-[5px] rotate-45 -mt-1"></div>
+                        <div className="absolute top-0 bottom-0 w-[2px] bg-white z-30 pointer-events-none" style={{ left: `${currentTime * PX_PER_SEC}px` }}>
+                            <div className="w-0 h-0 border-l-[5px] border-l-transparent border-r-[5px] border-r-transparent border-t-[6px] border-t-white -ml-[4px]"></div>
                         </div>
 
-                        {tracks.map(track => (
-                            <div 
-                                key={track.id} 
-                                className={`h-28 border-b border-gray-800 relative ${track.isMuted ? 'opacity-50' : ''} ${selectedTrackId === track.id ? 'bg-purple-900/10' : 'bg-gray-900/30'}`}
-                                style={{ minWidth: `${120 * PX_PER_SEC}px` }}
-                            >
-                                {/* Grid Lines */}
-                                <div className="absolute inset-0 pointer-events-none opacity-10" 
-                                    style={{ backgroundImage: `linear-gradient(to right, #ffffff 1px, transparent 1px)`, backgroundSize: `${PX_PER_SEC / 2}px 100%` }} 
-                                />
-
-                                {track.clips.map(clip => (
-                                    <div
-                                        key={clip.id}
-                                        className={`absolute h-[90%] top-[5%] rounded-md overflow-hidden border-2 cursor-pointer group select-none transition-all ${
-                                            selectedClipId === clip.id ? 'border-white ring-2 ring-white/50 shadow-lg' : 'border-transparent hover:border-white/30'
-                                        }`}
-                                        style={{
-                                            left: `${clip.startTime * PX_PER_SEC}px`,
-                                            width: `${clip.duration * PX_PER_SEC}px`,
-                                        }}
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            setSelectedClipId(clip.id);
-                                        }}
-                                        onMouseDown={(e) => {
-                                            e.stopPropagation();
-                                            setSelectedClipId(clip.id);
-                                            setDragState({
-                                                type: 'MOVE',
-                                                clipId: clip.id,
-                                                trackId: track.id,
-                                                startX: e.clientX,
-                                                originalStart: clip.startTime,
-                                                originalDuration: clip.duration
-                                            });
-                                        }}
-                                    >
-                                        {/* Waveform */}
-                                        <div className={`w-full h-full flex items-center ${clip.color || "bg-blue-600"}`}>
-                                            <div className="flex items-center gap-[1px] h-full w-full px-1">
-                                                {(clip.waveformData || Array(50).fill(0.2)).map((val, i) => (
-                                                    <div key={i} className="flex-1 bg-black/40 rounded-full min-w-[1px]" style={{ height: `${Math.max(val * 100, 10)}%` }} />
-                                                ))}
-                                            </div>
-                                        </div>
-
-                                        {/* Clip Name */}
-                                        <span className="absolute top-1 left-2 text-[10px] font-bold text-white drop-shadow-md truncate max-w-[calc(100%-16px)]">
-                                            {clip.name}
-                                        </span>
-
-                                        {/* Duration Label */}
-                                        <span className="absolute bottom-1 right-2 text-[9px] text-white/60">
-                                            {clip.duration.toFixed(1)}s
-                                        </span>
-
-                                        {/* Resize Handle (Right) */}
-                                        <div 
-                                            className="absolute right-0 top-0 bottom-0 w-3 hover:bg-white/30 cursor-ew-resize z-20 opacity-0 group-hover:opacity-100 transition-opacity"
+                        {/* Tracks Area */}
+                        <div className="relative" style={{ minWidth: `${120 * PX_PER_SEC}px` }}>
+                            {tracks.map(track => (
+                                <div 
+                                    key={track.id} 
+                                    className={`h-32 border-b border-white/5 relative ${track.isMuted ? 'opacity-50' : ''} ${selectedTrackId === track.id ? 'bg-purple-900/10' : 'bg-gradient-to-b from-white/[0.02] to-transparent'}`}
+                                >
+                                    {/* Grid Lines */}
+                                    <div className="absolute inset-0 pointer-events-none opacity-5" style={{ backgroundImage: `linear-gradient(to right, #fff 1px, transparent 1px)`, backgroundSize: `${PX_PER_SEC}px 100%` }} />
+                                    
+                                    {/* Clips */}
+                                    {track.clips.map(clip => (
+                                        <div
+                                            key={clip.id}
+                                            className={`absolute h-[80%] top-[10%] rounded overflow-hidden border-2 cursor-move group transition-shadow ${
+                                                selectedClipId === clip.id 
+                                                    ? 'ring-2 ring-white/50 border-white shadow-lg' 
+                                                    : 'border-blue-500/50 hover:border-blue-400'
+                                            } ${clip.color || 'bg-blue-600/20'}`}
+                                            style={getRenderStyle(clip)}
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                setSelectedClipId(clip.id);
+                                            }}
                                             onMouseDown={(e) => {
                                                 e.stopPropagation();
+                                                setSelectedClipId(clip.id);
                                                 setDragState({
-                                                    type: 'RESIZE_R',
+                                                    type: 'MOVE',
                                                     clipId: clip.id,
-                                                    trackId: track.id,
+                                                    fromTrackId: track.id,
                                                     startX: e.clientX,
+                                                    currentX: e.clientX,
+                                                    currentY: e.clientY,
                                                     originalStart: clip.startTime,
                                                     originalDuration: clip.duration
                                                 });
                                             }}
-                                        />
-                                    </div>
-                                ))}
-                            </div>
-                        ))}
+                                        >
+                                            {/* Waveform */}
+                                            <div className="w-full h-full flex items-center px-1 gap-[1px]">
+                                                {(clip.waveformData || Array(40).fill(0.3)).map((v, i) => (
+                                                    <div key={i} className="flex-1 bg-blue-200/40 rounded-full min-w-[1px]" style={{ height: `${Math.min(100, Math.max(10, v * 100))}%` }} />
+                                                ))}
+                                            </div>
+                                            
+                                            {/* Clip Name */}
+                                            <span className="absolute top-1 left-2 text-[10px] font-bold text-white drop-shadow truncate max-w-[calc(100%-24px)]">{clip.name}</span>
+                                            
+                                            {/* Duration */}
+                                            <span className="absolute bottom-1 right-2 text-[9px] text-white/60">{clip.duration.toFixed(1)}s</span>
+                                            
+                                            {/* Resize Handle */}
+                                            <div 
+                                                className="absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize hover:bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                                                onMouseDown={(e) => {
+                                                    e.stopPropagation();
+                                                    setDragState({
+                                                        type: 'RESIZE_R',
+                                                        clipId: clip.id,
+                                                        fromTrackId: track.id,
+                                                        startX: e.clientX,
+                                                        currentX: e.clientX,
+                                                        currentY: e.clientY,
+                                                        originalStart: clip.startTime,
+                                                        originalDuration: clip.duration
+                                                    });
+                                                }}
+                                            />
+                                        </div>
+                                    ))}
+                                </div>
+                            ))}
+                        </div>
                     </div>
                 </div>
             ) : (
                 /* --- UPLOAD TAB --- */
-                <div className="flex-1 bg-gray-950 overflow-y-auto p-8 flex justify-center">
+                <div className="flex-1 bg-[#121214] overflow-y-auto p-8 flex justify-center">
                     <div className="w-full max-w-2xl bg-gray-900 border border-white/10 rounded-2xl p-8 shadow-2xl">
                         <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
                             📤 Upload Track
