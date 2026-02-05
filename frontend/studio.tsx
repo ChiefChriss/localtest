@@ -1,216 +1,223 @@
-import { useEffect, useState, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
-import Sidebar from './components/Sidebar';
+import { useState, useEffect, useRef } from "react";
+import axios from "axios";
+import { Link } from 'react-router-dom';
+import * as Tone from "tone";
+import Logo from './components/Logo';
 
-interface UserProfile {
-    id: number;
-    username: string;
-    is_creator: boolean;
-    is_listener: boolean;
-    creator_since: string | null;
-    profile_picture: string | null;
-}
-
-interface UploadFormData {
-    title: string;
-    genre: string;
-    bpm: string;
-    coverArt: File | null;
-    coverArtPreview: string | null;
-}
-
-const GENRE_OPTIONS = [
-    'Hip Hop', 'R&B', 'Pop', 'Electronic', 'Rock', 'Jazz',
-    'Classical', 'Country', 'Reggae', 'Latin', 'Afrobeats', 'Other'
+// Define the rows of our sequencer (Kick, Snare, HiHat, Melody)
+const INITIAL_GRID = [
+    { name: "Kick", note: "C2", active: [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0] },
+    { name: "Snare", note: "D2", active: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0] },
+    { name: "HiHat", note: "G2", active: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] },
+    { name: "Synth", note: "C4", active: [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0] },
 ];
 
-const Studio = () => {
-    const navigate = useNavigate();
-    const [profile, setProfile] = useState<UserProfile | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [uploading, setUploading] = useState(false);
-    const [showUploadModal, setShowUploadModal] = useState(false);
-    const [selectedAudioFile, setSelectedAudioFile] = useState<File | null>(null);
-    const [uploadForm, setUploadForm] = useState<UploadFormData>({
-        title: '',
-        genre: '',
-        bpm: '',
-        coverArt: null,
-        coverArtPreview: null
-    });
-    const fileInputRef = useRef<HTMLInputElement>(null);
-    const coverArtInputRef = useRef<HTMLInputElement>(null);
+export default function Studio() {
+    const [grid, setGrid] = useState(INITIAL_GRID);
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [currentStep, setCurrentStep] = useState(0);
+    const [projectName, setProjectName] = useState("My New Beat");
 
-    useEffect(() => {
-        const fetchData = async () => {
-            const accessToken = localStorage.getItem('accessToken');
-            if (!accessToken) { navigate('/login'); return; }
-            const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-
-            try {
-                const profileRes = await fetch(`${API_BASE_URL}/api/auth/profile/`, {
-                    headers: { 'Authorization': `Bearer ${accessToken}` }
-                });
-                if (profileRes.ok) setProfile(await profileRes.json());
-            } catch (error) {
-                console.error("Error fetching studio data:", error);
-            } finally {
-                setLoading(false);
-            }
-        };
-        fetchData();
-    }, [navigate]);
-
-    const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
-        const file = event.target.files?.[0];
-        if (!file) return;
-
-        setSelectedAudioFile(file);
-        setUploadForm({
-            title: file.name.replace(/\.[^/.]+$/, ""),
-            genre: '',
-            bpm: '',
-            coverArt: null,
-            coverArtPreview: null
-        });
-        setShowUploadModal(true);
-        if (fileInputRef.current) fileInputRef.current.value = "";
-    };
-
-    const handleCoverArtSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
-        const file = event.target.files?.[0];
-        if (!file) return;
-        setUploadForm(prev => ({ ...prev, coverArt: file, coverArtPreview: URL.createObjectURL(file) }));
-    };
-
-    const handleUploadSubmit = async () => {
-        if (!selectedAudioFile) return;
-        setUploading(true);
-        const accessToken = localStorage.getItem('accessToken');
+    const saveProject = async () => {
+        const token = localStorage.getItem("accessToken");
         const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-        const formData = new FormData();
-        formData.append('audio_file', selectedAudioFile);
-        formData.append('title', uploadForm.title || 'Untitled Track');
-        if (uploadForm.genre) formData.append('genre', uploadForm.genre);
-        if (uploadForm.bpm) formData.append('bpm', uploadForm.bpm);
-        if (uploadForm.coverArt) formData.append('cover_art', uploadForm.coverArt);
+
+        if (!token) {
+            alert("You must be logged in to save!");
+            return;
+        }
 
         try {
-            const response = await fetch(`${API_BASE_URL}/api/music/tracks/`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${accessToken}` },
-                body: formData
+            const payload = {
+                title: projectName,
+                bpm: 120, // To be made dynamic later
+                grid_data: grid,
+            };
+
+            const response = await axios.post(`${API_BASE_URL}/api/music/projects/`, payload, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                },
             });
 
-            if (response.ok) {
-                alert("Upload successful!");
-                closeUploadModal();
-                navigate('/my-songs'); // Redirect to my songs after upload
-            } else {
-                alert("Upload failed! Please check if the info is valid.");
-            }
+            alert("Project Saved Successfully!");
+            console.log("Saved:", response.data);
+
         } catch (error) {
-            console.error("Error uploading track:", error);
-            alert("Error uploading track");
-        } finally {
-            setUploading(false);
+            console.error("Failed to save:", error);
+            alert("Error saving project.");
         }
     };
 
-    const closeUploadModal = () => {
-        setShowUploadModal(false);
-        setSelectedAudioFile(null);
-        if (uploadForm.coverArtPreview) URL.revokeObjectURL(uploadForm.coverArtPreview);
-        setUploadForm({ title: '', genre: '', bpm: '', coverArt: null, coverArtPreview: null });
+    // Refs to store the Tone.js instruments so they don't re-create on every render
+    const synthRef = useRef<Tone.PolySynth | null>(null);
+    const drumRef = useRef<Tone.MembraneSynth | null>(null);
+    const hatRef = useRef<Tone.MetalSynth | null>(null);
+
+    // 1. Initialize Audio Engine (Runs once)
+    useEffect(() => {
+        synthRef.current = new Tone.PolySynth().toDestination();
+        drumRef.current = new Tone.MembraneSynth().toDestination();
+        hatRef.current = new Tone.MetalSynth({
+            envelope: { attack: 0.001, decay: 0.1, release: 0.01 },
+            harmonicity: 5.1,
+            modulationIndex: 32,
+            resonance: 4000,
+            octaves: 1.5,
+        }).toDestination();
+
+        return () => {
+            // Cleanup when leaving the page
+            synthRef.current?.dispose();
+            drumRef.current?.dispose();
+            hatRef.current?.dispose();
+        };
+    }, []);
+
+    // 2. The Sequencer Loop
+    useEffect(() => {
+        const loop = new Tone.Sequence(
+            (time, step) => {
+                // Update the visual UI step
+                setCurrentStep(step);
+
+                // Trigger sounds based on the Grid state
+                grid.forEach((row) => {
+                    if (row.active[step] === 1) {
+                        if (row.name === "Kick") drumRef.current?.triggerAttackRelease(row.note, "8n", time);
+                        if (row.name === "Snare") drumRef.current?.triggerAttackRelease(row.note, "8n", time);
+                        if (row.name === "HiHat") hatRef.current?.triggerAttackRelease("32n", time, -10); // Lower volume
+                        if (row.name === "Synth") synthRef.current?.triggerAttackRelease(row.note, "8n", time);
+                    }
+                });
+            },
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], // 16 steps
+            "16n"
+        ).start(0);
+
+        return () => {
+            loop.dispose();
+        };
+    }, [grid]); // Re-create loop if grid changes (simple version)
+
+    // 3. Handle Play/Stop
+    const handlePlay = async () => {
+        await Tone.start(); // Required by browser to start audio context
+
+        if (isPlaying) {
+            Tone.Transport.stop();
+            setIsPlaying(false);
+            setCurrentStep(0);
+        } else {
+            Tone.Transport.start();
+            setIsPlaying(true);
+        }
     };
 
-    if (loading) return <div className="min-h-screen bg-black flex items-center justify-center"><div className="w-6 h-6 border-2 border-purple-500 rounded-full animate-spin border-t-transparent"></div></div>;
+    // 4. Handle Grid Clicks
+    const toggleStep = (rowIndex: number, stepIndex: number) => {
+        const newGrid = [...grid];
+        newGrid[rowIndex].active[stepIndex] = newGrid[rowIndex].active[stepIndex] === 1 ? 0 : 1;
+        setGrid(newGrid);
+    };
 
     return (
-        <div className="min-h-screen w-full bg-black text-white font-sans selection:bg-purple-500 selection:text-white flex">
-            <Sidebar profile={profile} />
-            <div className="flex-grow ml-16 md:ml-64 p-8 relative">
+        <div className="flex bg-black text-white min-h-screen">
+            {/* Sidebar - Retaining navigation from previous setup */}
+            <div className="w-20 lg:w-64 border-r border-white/10 flex flex-col p-4 bg-white/5 backdrop-blur-xl h-screen fixed left-0 top-0 z-20">
+                <div className="mb-8 flex justify-center lg:justify-start">
+                    <Link to="/">
+                        <Logo size="md" showText={false} className="lg:hidden" />
+                        <Logo size="md" showText={true} className="hidden lg:flex" />
+                    </Link>
+                </div>
+                <nav className="space-y-2 flex-grow">
+                    <Link to="/studio" className="flex items-center gap-3 p-3 rounded-xl bg-purple-600/20 text-purple-300 font-medium">
+                        <span>🎛️</span>
+                        <span className="hidden lg:block">Studio</span>
+                    </Link>
+                    <Link to="/my-songs" className="flex items-center gap-3 p-3 rounded-xl hover:bg-white/5 text-gray-400 hover:text-white transition-colors">
+                        <span>🎵</span>
+                        <span className="hidden lg:block">My Songs</span>
+                    </Link>
+                    <Link to="/" className="flex items-center gap-3 p-3 rounded-xl hover:bg-white/5 text-gray-400 hover:text-white transition-colors">
+                        <span>🏠</span>
+                        <span className="hidden lg:block">Home</span>
+                    </Link>
+                </nav>
+            </div>
+
+            <div className="flex-grow ml-20 lg:ml-64 p-8 relative flex flex-col items-center justify-center">
+                {/* Background Effect */}
                 <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0 pointer-events-none">
                     <div className="absolute top-[-20%] right-[-10%] w-[800px] h-[800px] bg-purple-900/20 rounded-full mix-blend-screen filter blur-[120px] opacity-30"></div>
                 </div>
-                <div className="relative z-10 max-w-5xl mx-auto space-y-8 h-full flex flex-col items-center justify-center pt-20">
-                    <div className="text-center space-y-4">
-                        <h1 className="text-5xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-600">
-                            Creator Studio
-                        </h1>
-                        <p className="text-xl text-gray-400 max-w-lg mx-auto">
-                            Upload your latest creation or manage your existing tracks.
-                        </p>
+
+                <div className="relative z-10 w-full max-w-4xl">
+                    <div className="flex items-center justify-between gap-4 mb-8">
+                        <div>
+                            <h1 className="text-4xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-600">Studio</h1>
+                            <p className="text-gray-400">Sequence your beat.</p>
+                        </div>
+                        <div className="flex gap-4 items-center">
+                            <input
+                                type="text"
+                                value={projectName}
+                                onChange={(e) => setProjectName(e.target.value)}
+                                className="px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white focus:outline-none focus:border-purple-500/50"
+                                placeholder="Project Name"
+                            />
+                            <button
+                                onClick={saveProject}
+                                className="px-6 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold transition-colors shadow-lg shadow-blue-900/30"
+                            >
+                                SAVE PROJECT
+                            </button>
+                            <button
+                                onClick={handlePlay}
+                                className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg ${isPlaying
+                                    ? "bg-red-500 hover:bg-red-600 shadow-red-900/30"
+                                    : "bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 shadow-green-900/30"
+                                    }`}
+                            >
+                                {isPlaying ? "STOP" : "PLAY"}
+                            </button>
+                        </div>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-4xl mt-12">
-                        {/* Upload Card */}
-                        <div
-                            onClick={() => fileInputRef.current?.click()}
-                            className="group relative overflow-hidden bg-white/5 border border-white/10 rounded-3xl p-8 hover:bg-white/10 transition-all cursor-pointer hover:border-purple-500/50 hover:shadow-2xl hover:shadow-purple-900/20"
-                        >
-                            <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                                <span className="text-9xl">☁️</span>
-                            </div>
-                            <div className="relative z-10 flex flex-col items-center text-center space-y-4">
-                                <div className="w-20 h-20 bg-purple-600/20 rounded-2xl flex items-center justify-center group-hover:scale-110 transition-transform">
-                                    <span className="text-4xl text-purple-400">+</span>
+                    <div className="bg-gray-900/80 border border-white/10 p-8 rounded-3xl shadow-2xl backdrop-blur-md">
+                        {grid.map((row, rowIndex) => (
+                            <div key={row.name} className="flex items-center mb-6 last:mb-0">
+                                <div className="w-24 font-mono text-sm font-bold text-gray-400 uppercase tracking-widest">{row.name}</div>
+                                <div className="flex gap-1.5 flex-1">
+                                    {row.active.map((isActive, stepIndex) => (
+                                        <div
+                                            key={stepIndex}
+                                            onClick={() => toggleStep(rowIndex, stepIndex)}
+                                            className={`
+                            h-16 flex-1 rounded-lg cursor-pointer transition-all border border-white/5
+                            ${isActive
+                                                    ? "bg-gradient-to-t from-purple-600 to-pink-500 shadow-[0_0_15px_rgba(168,85,247,0.4)] border-transparent"
+                                                    : "bg-white/5 hover:bg-white/10"
+                                                }
+                            ${currentStep === stepIndex ? "border-white/50 border-2 scale-105 brightness-125 z-10" : ""}
+                            ${stepIndex % 4 === 0 && stepIndex !== 0 ? "ml-2" : ""} 
+                        `}
+                                        />
+                                    ))}
                                 </div>
-                                <h3 className="text-2xl font-bold">Upload New Track</h3>
-                                <p className="text-gray-400">Drag & drop or click to upload your audio file (MP3, WAV).</p>
                             </div>
-                            <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="audio/*" className="hidden" />
-                        </div>
+                        ))}
+                    </div>
 
-                        {/* My Songs Card */}
-                        <div
-                            onClick={() => navigate('/my-songs')}
-                            className="group relative overflow-hidden bg-white/5 border border-white/10 rounded-3xl p-8 hover:bg-white/10 transition-all cursor-pointer hover:border-pink-500/50 hover:shadow-2xl hover:shadow-pink-900/20"
-                        >
-                            <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                                <span className="text-9xl">🎵</span>
-                            </div>
-                            <div className="relative z-10 flex flex-col items-center text-center space-y-4">
-                                <div className="w-20 h-20 bg-pink-600/20 rounded-2xl flex items-center justify-center group-hover:scale-110 transition-transform">
-                                    <span className="text-4xl text-pink-400">☰</span>
-                                </div>
-                                <h3 className="text-2xl font-bold">My Songs</h3>
-                                <p className="text-gray-400">View analytics, edit details, and manage your published tracks.</p>
-                            </div>
-                        </div>
+                    <div className="mt-8 flex justify-end">
+                        <button className="bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white px-6 py-2 rounded-xl text-sm font-medium transition-colors border border-white/5">
+                            Clear Grid
+                        </button>
                     </div>
                 </div>
             </div>
-
-            {/* Upload Modal */}
-            {showUploadModal && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-                    <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={closeUploadModal} />
-                    <div className="relative bg-gray-900/95 border border-white/10 rounded-2xl p-6 w-full max-w-lg shadow-2xl shadow-purple-900/20">
-                        <div className="flex items-center justify-between mb-6">
-                            <h2 className="text-2xl font-bold text-white">Upload Track</h2>
-                            <button onClick={closeUploadModal} className="text-gray-400 hover:text-white transition-colors text-2xl">×</button>
-                        </div>
-                        <div className={`bg-white/5 border border-white/10 rounded-xl p-4 mb-6`}>
-                            <div className="flex items-center gap-3">
-                                <div className="w-10 h-10 bg-purple-600/20 rounded-lg flex items-center justify-center text-purple-400">🎵</div>
-                                <div className="flex-1 min-w-0"><p className="text-white font-medium truncate">{selectedAudioFile ? selectedAudioFile.name : ''}</p></div>
-                            </div>
-                        </div>
-                        <div className="space-y-4">
-                            <div><label className="block text-sm font-medium text-gray-300 mb-2">Title *</label><input type="text" value={uploadForm.title} onChange={(e) => setUploadForm(prev => ({ ...prev, title: e.target.value }))} className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white" /></div>
-                            <div><label className="block text-sm font-medium text-gray-300 mb-2">Genre</label><select value={uploadForm.genre} onChange={(e) => setUploadForm(prev => ({ ...prev, genre: e.target.value }))} className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white bg-gray-900"><option value="">Select a genre</option>{GENRE_OPTIONS.map(g => <option key={g} value={g}>{g}</option>)}</select></div>
-                            <div><label className="block text-sm font-medium text-gray-300 mb-2">BPM</label><input type="number" value={uploadForm.bpm} onChange={(e) => setUploadForm(prev => ({ ...prev, bpm: e.target.value }))} className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white" /></div>
-                            <div><label className="block text-sm font-medium text-gray-300 mb-2">Cover Art</label><input type="file" ref={coverArtInputRef} onChange={handleCoverArtSelect} accept="image/*" className="w-full text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-purple-600 file:text-white hover:file:bg-purple-700" /></div>
-                        </div>
-                        <div className="flex gap-3 mt-6">
-                            <button onClick={closeUploadModal} className="flex-1 py-3 px-6 bg-white/5 hover:bg-white/10 text-white rounded-xl">Cancel</button>
-                            <button onClick={handleUploadSubmit} disabled={uploading} className="flex-1 py-3 px-6 bg-purple-600 hover:bg-purple-500 text-white rounded-xl">{uploading ? 'Uploading...' : 'Upload'}</button>
-                        </div>
-                    </div>
-                </div>
-            )}
         </div>
     );
-};
-export default Studio;
+}

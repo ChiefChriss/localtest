@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Track, Like
+from .models import Track, Like, Project
 
 class TrackSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.username')
@@ -46,3 +46,10 @@ class LikeSerializer(serializers.ModelSerializer):
         model = Like
         fields = ['id', 'user', 'track', 'created_at']
         read_only_fields = ['user', 'created_at']
+
+
+class ProjectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Project
+        fields = ['id', 'user', 'title', 'bpm', 'grid_data', 'last_updated']
+        read_only_fields = ['user', 'last_updated']

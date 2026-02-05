@@ -38,3 +38,16 @@ class Repost(models.Model):
 
     def __str__(self):
         return f"{self.user.username} reposted {self.track.title}"
+
+
+class Project(models.Model):
+    """Stores the raw DAW state (JSON) so users can edit beats later"""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='projects')
+    title = models.CharField(max_length=255, default="Untitled Project")
+    bpm = models.IntegerField(default=120)
+    # This JSONField stores the React Grid state
+    grid_data = models.JSONField(default=dict) 
+    last_updated = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Project: {self.title} by {self.user.username}"

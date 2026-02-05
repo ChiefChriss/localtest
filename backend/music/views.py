@@ -1,8 +1,8 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from .models import Track, Like
-from .serializers import TrackSerializer, LikeSerializer
+from .models import Track, Like, Project
+from .serializers import TrackSerializer, LikeSerializer, ProjectSerializer
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.utils import timezone
 from datetime import timedelta
@@ -83,3 +83,30 @@ class LikedTracksView(generics.ListAPIView):
 
     def get_queryset(self):
         return Track.objects.filter(likes__user=self.request.user).order_by('-likes__created_at')
+
+
+class ProjectListCreateView(generics.ListCreateAPIView):
+    """
+    GET: List all my projects
+    POST: Save a new project (Save the Grid JSON)
+    """
+    serializer_class = ProjectSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Project.objects.filter(user=self.request.user).order_by('-last_updated')
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET: Load a specific project
+    PUT: Update an existing project
+    DELETE: Delete a project
+    """
+    serializer_class = ProjectSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Project.objects.filter(user=self.request.user)
