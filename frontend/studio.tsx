@@ -83,6 +83,7 @@ export default function Studio() {
     // --- REFS ---
     const playersRef = useRef<Map<string, Tone.Player>>(new Map());
     const channelsRef = useRef<Map<string, Tone.Channel>>(new Map());
+    const buffersRef = useRef<Map<string, Tone.ToneAudioBuffer>>(new Map()); // Store audio buffers for instant playback
     const recorderRef = useRef<Tone.Recorder | null>(null);
     const micRef = useRef<Tone.UserMedia | null>(null);
     const animationFrameRef = useRef<number | null>(null);
@@ -162,7 +163,7 @@ export default function Studio() {
                             pan: t.pan ?? 0
                         }));
                         setTracks(loadedTracks);
-                        
+
                         // Re-generate waveforms if missing
                         for (const track of loadedTracks) {
                             for (const clip of track.clips) {
@@ -178,8 +179,8 @@ export default function Studio() {
                         }
                     }
                 }
-            } catch (err) { 
-                console.error("Load failed", err); 
+            } catch (err) {
+                console.error("Load failed", err);
             } finally {
                 setLoading(false);
             }
@@ -212,10 +213,18 @@ export default function Studio() {
             channel.mute = track.isMuted;
             channel.solo = track.isSolo;
 
-            // Pre-load players (but don't sync yet - we do that on play)
+            // Pre-load players (use stored buffer if available for instant playback)
             track.clips.forEach(clip => {
                 if (!playersRef.current.has(clip.id)) {
-                    const player = new Tone.Player(clip.url).connect(channel);
+                    const buffer = buffersRef.current.get(clip.id);
+                    
+                    // Use buffer if available (for newly imported/recorded clips)
+                    // Otherwise fallback to URL (for clips loaded from saved projects)
+                    const player = buffer 
+                        ? new Tone.Player(buffer) 
+                        : new Tone.Player(clip.url);
+                    
+                    player.connect(channel);
                     playersRef.current.set(clip.id, player);
                 }
             });
@@ -225,12 +234,12 @@ export default function Studio() {
     // --- 4. PLAYBACK CONTROLS ---
     const handlePlay = async () => {
         await Tone.start();
-        
+
         if (isPlaying) {
             // Pause
             Tone.Transport.pause();
             playersRef.current.forEach(p => {
-                try { p.stop(); } catch(e) {}
+                try { p.stop(); } catch (e) { }
             });
             setIsPlaying(false);
         } else {
@@ -238,10 +247,10 @@ export default function Studio() {
             Tone.Transport.stop();
             Tone.Transport.cancel();
             playersRef.current.forEach(p => {
-                try { 
+                try {
                     p.stop();
                     p.unsync();
-                } catch(e) {}
+                } catch (e) { }
             });
 
             // Wait for all audio to load
@@ -250,20 +259,32 @@ export default function Studio() {
             // Schedule all clips on Transport
             tracks.forEach(track => {
                 if (track.isMuted) return;
-                
+
                 const channel = channelsRef.current.get(track.id);
-                
+
                 track.clips.forEach(clip => {
-                    const player = playersRef.current.get(clip.id);
-                    if (player && player.loaded) {
-                        // Ensure player is connected to the right channel
+                    // Create a new player if one doesn't exist
+                    let player = playersRef.current.get(clip.id);
+                    if (!player) {
+                        player = new Tone.Player(clip.url).connect(channel!);
+                        playersRef.current.set(clip.id, player);
+                    }
+
+                    // Wait for the buffer to load
+                    if (player.loaded) {
+                        // Disconnect and reconnect to ensure it goes to the right channel
                         player.disconnect();
                         player.connect(channel!);
-                        
-                        // Schedule this clip
-                        Tone.Transport.schedule((time) => {
-                            player.start(time, 0, clip.duration);
-                        }, clip.startTime);
+
+                        // Schedule
+                        player.sync().start(clip.startTime, 0, clip.duration);
+                    } else {
+                        // If not loaded, try to load and then sync
+                        player.load(clip.url).then(() => {
+                            player!.disconnect();
+                            player!.connect(channel!);
+                            player!.sync().start(clip.startTime, 0, clip.duration);
+                        });
                     }
                 });
             });
@@ -280,10 +301,10 @@ export default function Studio() {
         Tone.Transport.cancel();
         Tone.Transport.seconds = 0;
         playersRef.current.forEach(p => {
-            try { 
+            try {
                 p.stop();
                 p.unsync();
-            } catch(e) {}
+            } catch (e) { }
         });
         setIsPlaying(false);
         setCurrentTime(0);
@@ -311,11 +332,11 @@ export default function Studio() {
 
         // 2. Identify Target Track (Vertical Drag)
         // Header is ~56px (h-14), each track is 128px (h-32)
-        const headerHeight = 56; 
-        const trackHeight = 128; 
+        const headerHeight = 56;
+        const trackHeight = 128;
         const relativeY = dragState.currentY - headerHeight;
         const trackIndex = Math.floor(relativeY / trackHeight);
-        
+
         let targetTrackId = dragState.fromTrackId;
         if (trackIndex >= 0 && trackIndex < tracks.length) {
             targetTrackId = tracks[trackIndex].id;
@@ -351,9 +372,9 @@ export default function Studio() {
                 const clipToMove = tracks.find(t => t.id === dragState.fromTrackId)?.clips.find(c => c.id === dragState.clipId);
                 if (clipToMove) {
                     const rawNewTime = dragState.originalStart + deltaTime;
-                    const movedClip = { 
-                        ...clipToMove, 
-                        startTime: Math.max(0, Math.round(rawNewTime / SNAP_GRID) * SNAP_GRID) 
+                    const movedClip = {
+                        ...clipToMove,
+                        startTime: Math.max(0, Math.round(rawNewTime / SNAP_GRID) * SNAP_GRID)
                     };
                     return { ...track, clips: [...track.clips, movedClip] };
                 }
@@ -390,9 +411,15 @@ export default function Studio() {
                 const url = URL.createObjectURL(blob);
                 const buffer = await new Tone.ToneAudioBuffer().load(url);
                 const waveData = await generateWaveform(url, 100);
+
+                // Generate ID first so we can store buffer with matching ID
+                const clipId = crypto.randomUUID();
                 
+                // Store buffer for instant playback (avoids blob URL loading issues)
+                buffersRef.current.set(clipId, buffer);
+
                 const newClip: Clip = {
-                    id: crypto.randomUUID(),
+                    id: clipId,
                     url,
                     name: "Rec " + (tracks.find(t => t.id === selectedTrackId)?.clips.length || 0 + 1),
                     startTime: Math.max(0, Tone.Transport.seconds - buffer.duration),
@@ -425,8 +452,14 @@ export default function Studio() {
         const buffer = await new Tone.ToneAudioBuffer().load(url);
         const waveData = await generateWaveform(url, 100);
 
+        // Generate ID first so we can store buffer with matching ID
+        const clipId = crypto.randomUUID();
+        
+        // Store buffer for instant playback (avoids blob URL loading issues)
+        buffersRef.current.set(clipId, buffer);
+
         const newClip: Clip = {
-            id: crypto.randomUUID(),
+            id: clipId,
             url,
             startTime: 0,
             duration: buffer.duration,
@@ -540,7 +573,7 @@ export default function Studio() {
         Tone.Transport.stop();
         setIsPlaying(false);
         setIsRecording(false);
-        
+
         tracks.forEach(track => {
             track.clips.forEach(clip => {
                 if (clip.url.startsWith('blob:')) {
@@ -548,10 +581,10 @@ export default function Studio() {
                 }
             });
         });
-        
+
         playersRef.current.forEach(p => p.dispose());
         playersRef.current.clear();
-        
+
         setTracks([
             { id: "1", name: "Beat", isMuted: false, isSolo: false, volume: -6, pan: 0, clips: [] },
             { id: "2", name: "Vocals", isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }
@@ -571,13 +604,13 @@ export default function Studio() {
                         URL.revokeObjectURL(clip.url);
                     }
                 }
-                
+
                 // Dispose player
                 const player = playersRef.current.get(selectedClipId);
                 player?.dispose();
                 playersRef.current.delete(selectedClipId);
-                
-                setTracks(prev => prev.map(t => ({...t, clips: t.clips.filter(c => c.id !== selectedClipId)})));
+
+                setTracks(prev => prev.map(t => ({ ...t, clips: t.clips.filter(c => c.id !== selectedClipId) })));
                 setSelectedClipId(null);
             }
         };
@@ -594,14 +627,14 @@ export default function Studio() {
 
         setIsUploading(true);
         const formData = new FormData();
-        
+
         formData.append('title', uploadForm.title);
         formData.append('genre', uploadForm.genre);
         if (uploadForm.bpm) formData.append('bpm', uploadForm.bpm);
         if (uploadForm.price) formData.append('price', uploadForm.price);
         formData.append('description', uploadForm.description);
         if (uploadForm.tags) formData.append('tags', uploadForm.tags);
-        
+
         formData.append('audio_file', audioFile);
         if (coverArt) formData.append('cover_art', coverArt);
 
@@ -648,7 +681,7 @@ export default function Studio() {
     }
 
     return (
-        <div 
+        <div
             className="flex flex-col h-screen bg-[#121214] text-white font-sans overflow-hidden select-none"
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
@@ -678,7 +711,7 @@ export default function Studio() {
             <div className="h-14 bg-[#18181b] border-b border-white/5 flex items-center justify-between px-4 z-20">
                 <div className="flex items-center gap-4">
                     <Link to="/" className="opacity-80 hover:opacity-100"><Logo size="sm" showText={false} /></Link>
-                    
+
                     {/* View Switcher */}
                     <div className="flex bg-black/40 rounded-lg p-1">
                         <button onClick={() => setActiveTab('create')} className={`px-4 py-1 rounded text-xs font-bold ${activeTab === 'create' ? 'bg-gray-700 text-white' : 'text-gray-400'}`}>Studio</button>
@@ -719,19 +752,19 @@ export default function Studio() {
                             <button onClick={handleStop} className="w-8 h-8 flex items-center justify-center bg-gray-800 rounded hover:bg-gray-700 transition" title="Stop">
                                 <div className="w-3 h-3 bg-gray-400 rounded-sm"></div>
                             </button>
-                            <button 
-                                onClick={handlePlay} 
+                            <button
+                                onClick={handlePlay}
                                 className={`w-10 h-10 flex items-center justify-center rounded-full transition shadow-lg ${isPlaying ? 'bg-green-500/20 text-green-500 ring-1 ring-green-500' : 'bg-white/10 text-white hover:bg-white/20'}`}
                                 title="Play/Pause"
                             >
                                 {isPlaying ? (
-                                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" /></svg>
                                 ) : (
-                                    <svg className="w-4 h-4 fill-current ml-0.5" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                    <svg className="w-4 h-4 fill-current ml-0.5" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                                 )}
                             </button>
-                            <button 
-                                onClick={handleRecord} 
+                            <button
+                                onClick={handleRecord}
                                 className={`w-8 h-8 flex items-center justify-center rounded hover:bg-gray-700 transition ${isRecording ? 'text-red-500 bg-red-500/10 ring-1 ring-red-500' : 'text-red-600'}`}
                                 title="Record"
                             >
@@ -763,25 +796,25 @@ export default function Studio() {
                     {/* LEFT SIDEBAR (Tracks) */}
                     <div className="w-64 bg-[#18181b] border-r border-white/5 flex flex-col z-10 overflow-y-auto">
                         {tracks.map(track => (
-                            <div 
+                            <div
                                 key={track.id}
-                                onClick={() => setSelectedTrackId(track.id)} 
+                                onClick={() => setSelectedTrackId(track.id)}
                                 className={`h-32 border-b border-white/5 p-3 flex flex-col justify-between transition-colors cursor-pointer ${selectedTrackId === track.id ? 'bg-white/5 border-l-2 border-l-purple-500' : 'hover:bg-white/5'}`}
                             >
                                 <div className="flex justify-between items-center mb-1">
-                                    <input 
-                                        value={track.name} 
-                                        onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? { ...t, name: e.target.value } : t))} 
+                                    <input
+                                        value={track.name}
+                                        onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? { ...t, name: e.target.value } : t))}
                                         onClick={e => e.stopPropagation()}
-                                        className="bg-transparent font-bold text-sm w-24 focus:outline-none focus:bg-black/50 rounded px-1" 
+                                        className="bg-transparent font-bold text-sm w-24 focus:outline-none focus:bg-black/50 rounded px-1"
                                     />
                                     <div className="flex gap-1">
-                                        <button 
-                                            onClick={(e) => { e.stopPropagation(); setTracks(prev => prev.map(t => t.id === track.id ? {...t, isMuted: !t.isMuted} : t)); }} 
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setTracks(prev => prev.map(t => t.id === track.id ? { ...t, isMuted: !t.isMuted } : t)); }}
                                             className={`w-5 h-5 text-[10px] rounded flex items-center justify-center font-bold ${track.isMuted ? 'bg-red-500 text-white' : 'bg-[#27272a] text-gray-400 hover:bg-gray-600'}`}
                                         >M</button>
-                                        <button 
-                                            onClick={(e) => { e.stopPropagation(); setTracks(prev => prev.map(t => t.id === track.id ? {...t, isSolo: !t.isSolo} : t)); }} 
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setTracks(prev => prev.map(t => t.id === track.id ? { ...t, isSolo: !t.isSolo } : t)); }}
                                             className={`w-5 h-5 text-[10px] rounded flex items-center justify-center font-bold ${track.isSolo ? 'bg-yellow-500 text-black' : 'bg-[#27272a] text-gray-400 hover:bg-gray-600'}`}
                                         >S</button>
                                     </div>
@@ -789,21 +822,21 @@ export default function Studio() {
                                 <div className="space-y-3">
                                     <div className="flex items-center gap-2 group">
                                         <span className="text-[9px] text-gray-500 w-6">VOL</span>
-                                        <input 
-                                            type="range" min="-60" max="25" value={track.volume} 
+                                        <input
+                                            type="range" min="-60" max="25" value={track.volume}
                                             onClick={e => e.stopPropagation()}
-                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? {...t, volume: Number(e.target.value)} : t))} 
-                                            className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-500" 
+                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? { ...t, volume: Number(e.target.value) } : t))}
+                                            className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-500"
                                         />
                                         <span className="text-[9px] text-gray-400 w-8 text-right">{track.volume}dB</span>
                                     </div>
                                     <div className="flex items-center gap-2 group">
                                         <span className="text-[9px] text-gray-500 w-6">PAN</span>
-                                        <input 
-                                            type="range" min="-1" max="1" step="0.1" value={track.pan} 
+                                        <input
+                                            type="range" min="-1" max="1" step="0.1" value={track.pan}
                                             onClick={e => e.stopPropagation()}
-                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? {...t, pan: Number(e.target.value)} : t))} 
-                                            className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-500" 
+                                            onChange={e => setTracks(prev => prev.map(t => t.id === track.id ? { ...t, pan: Number(e.target.value) } : t))}
+                                            className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-500"
                                         />
                                         <span className="text-[9px] text-gray-400 w-8 text-right">
                                             {track.pan === 0 ? 'C' : track.pan < 0 ? `L${Math.abs(track.pan * 100).toFixed(0)}` : `R${(track.pan * 100).toFixed(0)}`}
@@ -812,8 +845,8 @@ export default function Studio() {
                                 </div>
                             </div>
                         ))}
-                        <button 
-                            onClick={() => setTracks([...tracks, { id: crypto.randomUUID(), name: `Track ${tracks.length+1}`, isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }])} 
+                        <button
+                            onClick={() => setTracks([...tracks, { id: crypto.randomUUID(), name: `Track ${tracks.length + 1}`, isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }])}
                             className="p-4 text-xs font-bold text-gray-500 hover:text-white hover:bg-white/5 border-b border-white/5 transition-colors"
                         >
                             + ADD TRACK
@@ -837,22 +870,21 @@ export default function Studio() {
                         {/* Tracks Area */}
                         <div className="relative" style={{ minWidth: `${120 * PX_PER_SEC}px` }}>
                             {tracks.map(track => (
-                                <div 
-                                    key={track.id} 
+                                <div
+                                    key={track.id}
                                     className={`h-32 border-b border-white/5 relative ${track.isMuted ? 'opacity-50' : ''} ${selectedTrackId === track.id ? 'bg-purple-900/10' : 'bg-gradient-to-b from-white/[0.02] to-transparent'}`}
                                 >
                                     {/* Grid Lines */}
                                     <div className="absolute inset-0 pointer-events-none opacity-5" style={{ backgroundImage: `linear-gradient(to right, #fff 1px, transparent 1px)`, backgroundSize: `${PX_PER_SEC}px 100%` }} />
-                                    
+
                                     {/* Clips */}
                                     {track.clips.map(clip => (
                                         <div
                                             key={clip.id}
-                                            className={`absolute h-[80%] top-[10%] rounded overflow-hidden border-2 cursor-move group transition-shadow ${
-                                                selectedClipId === clip.id 
-                                                    ? 'ring-2 ring-white/50 border-white shadow-lg' 
-                                                    : 'border-blue-500/50 hover:border-blue-400'
-                                            } ${clip.color || 'bg-blue-600/20'}`}
+                                            className={`absolute h-[80%] top-[10%] rounded overflow-hidden border-2 cursor-move group transition-shadow ${selectedClipId === clip.id
+                                                ? 'ring-2 ring-white/50 border-white shadow-lg'
+                                                : 'border-blue-500/50 hover:border-blue-400'
+                                                } ${clip.color || 'bg-blue-600/20'}`}
                                             style={getRenderStyle(clip)}
                                             onClick={(e) => {
                                                 e.stopPropagation();
@@ -879,15 +911,15 @@ export default function Studio() {
                                                     <div key={i} className="flex-1 bg-blue-200/40 rounded-full min-w-[1px]" style={{ height: `${Math.min(100, Math.max(10, v * 100))}%` }} />
                                                 ))}
                                             </div>
-                                            
+
                                             {/* Clip Name */}
                                             <span className="absolute top-1 left-2 text-[10px] font-bold text-white drop-shadow truncate max-w-[calc(100%-24px)]">{clip.name}</span>
-                                            
+
                                             {/* Duration */}
                                             <span className="absolute bottom-1 right-2 text-[9px] text-white/60">{clip.duration.toFixed(1)}s</span>
-                                            
+
                                             {/* Resize Handle */}
-                                            <div 
+                                            <div
                                                 className="absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize hover:bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity z-10"
                                                 onMouseDown={(e) => {
                                                     e.stopPropagation();
@@ -918,14 +950,14 @@ export default function Studio() {
                             📤 Upload Track
                             <span className="text-sm font-normal text-gray-400 bg-gray-800 px-2 py-1 rounded">MP3 / WAV</span>
                         </h2>
-                        
+
                         <form onSubmit={handleUploadSubmit} className="space-y-6">
                             {/* Audio File - Drag & Drop Zone */}
                             <div className="space-y-2">
                                 <label className="block text-sm font-medium text-gray-300">Audio File *</label>
                                 <div className="relative group">
-                                    <input 
-                                        type="file" 
+                                    <input
+                                        type="file"
                                         accept="audio/*"
                                         onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
                                         className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
@@ -958,8 +990,8 @@ export default function Studio() {
                             {/* Cover Art */}
                             <div className="space-y-2">
                                 <label className="block text-sm font-medium text-gray-300">Cover Art</label>
-                                <input 
-                                    type="file" 
+                                <input
+                                    type="file"
                                     accept="image/*"
                                     onChange={(e) => setCoverArt(e.target.files?.[0] || null)}
                                     className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gray-700 file:text-white hover:file:bg-gray-600"
@@ -971,10 +1003,10 @@ export default function Studio() {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 <div className="space-y-2">
                                     <label className="block text-sm font-medium text-gray-300">Track Title *</label>
-                                    <input 
-                                        type="text" 
+                                    <input
+                                        type="text"
                                         value={uploadForm.title}
-                                        onChange={(e) => setUploadForm({...uploadForm, title: e.target.value})}
+                                        onChange={(e) => setUploadForm({ ...uploadForm, title: e.target.value })}
                                         className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
                                         placeholder="e.g. Midnight Vibes"
                                         required
@@ -982,9 +1014,9 @@ export default function Studio() {
                                 </div>
                                 <div className="space-y-2">
                                     <label className="block text-sm font-medium text-gray-300">Genre</label>
-                                    <select 
+                                    <select
                                         value={uploadForm.genre}
-                                        onChange={(e) => setUploadForm({...uploadForm, genre: e.target.value})}
+                                        onChange={(e) => setUploadForm({ ...uploadForm, genre: e.target.value })}
                                         className="w-full bg-gray-900 text-white border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
                                     >
                                         <option value="" className="bg-gray-900 text-white">Select Genre</option>
@@ -1004,10 +1036,10 @@ export default function Studio() {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 <div className="space-y-2">
                                     <label className="block text-sm font-medium text-gray-300">BPM</label>
-                                    <input 
-                                        type="number" 
+                                    <input
+                                        type="number"
                                         value={uploadForm.bpm}
-                                        onChange={(e) => setUploadForm({...uploadForm, bpm: e.target.value})}
+                                        onChange={(e) => setUploadForm({ ...uploadForm, bpm: e.target.value })}
                                         className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
                                         placeholder="120"
                                         min={40} max={300}
@@ -1015,11 +1047,11 @@ export default function Studio() {
                                 </div>
                                 <div className="space-y-2">
                                     <label className="block text-sm font-medium text-gray-300">Price ($)</label>
-                                    <input 
-                                        type="number" 
+                                    <input
+                                        type="number"
                                         step="0.01"
                                         value={uploadForm.price}
-                                        onChange={(e) => setUploadForm({...uploadForm, price: e.target.value})}
+                                        onChange={(e) => setUploadForm({ ...uploadForm, price: e.target.value })}
                                         className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
                                         placeholder="29.99"
                                         min={0}
@@ -1029,9 +1061,9 @@ export default function Studio() {
 
                             <div className="space-y-2">
                                 <label className="block text-sm font-medium text-gray-300">Description</label>
-                                <textarea 
+                                <textarea
                                     value={uploadForm.description}
-                                    onChange={(e) => setUploadForm({...uploadForm, description: e.target.value})}
+                                    onChange={(e) => setUploadForm({ ...uploadForm, description: e.target.value })}
                                     className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500 h-24 resize-none"
                                     placeholder="Tell us about your track..."
                                 />
@@ -1039,21 +1071,20 @@ export default function Studio() {
 
                             <div className="space-y-2">
                                 <label className="block text-sm font-medium text-gray-300">Tags (comma separated)</label>
-                                <input 
-                                    type="text" 
+                                <input
+                                    type="text"
                                     value={uploadForm.tags}
-                                    onChange={(e) => setUploadForm({...uploadForm, tags: e.target.value})}
+                                    onChange={(e) => setUploadForm({ ...uploadForm, tags: e.target.value })}
                                     className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
                                     placeholder="e.g. Dark, Melodic, 140BPM"
                                 />
                             </div>
 
-                            <button 
-                                type="submit" 
+                            <button
+                                type="submit"
                                 disabled={isUploading}
-                                className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition-all transform hover:scale-[1.01] ${
-                                    isUploading ? "bg-gray-600 cursor-not-allowed" : "bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500"
-                                }`}
+                                className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition-all transform hover:scale-[1.01] ${isUploading ? "bg-gray-600 cursor-not-allowed" : "bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500"
+                                    }`}
                             >
                                 {isUploading ? "Uploading..." : "🚀 Publish to Market"}
                             </button>
