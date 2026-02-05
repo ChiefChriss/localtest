@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import * as Tone from "tone";
 import Logo from './components/Logo';
 
@@ -22,15 +22,17 @@ interface Track {
     clips: Clip[];
 }
 
-interface ProjectData {
-    id?: number;
-    title: string;
-    bpm: number;
-    tracks: Track[];
+// Drag state interface
+interface DragState {
+    clipId: string;
+    trackId: string;
+    startX: number;
+    originalStartTime: number;
 }
 
 export default function Studio() {
     const navigate = useNavigate();
+    const { id } = useParams(); // Get project ID from URL
 
     // STATE
     const [tracks, setTracks] = useState<Track[]>([
@@ -47,6 +49,7 @@ export default function Studio() {
     const [loading, setLoading] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
     const [recordStartTime, setRecordStartTime] = useState(0);
+    const [dragState, setDragState] = useState<DragState | null>(null);
 
     const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
@@ -81,7 +84,10 @@ export default function Studio() {
                     return;
                 }
 
-                setLoading(false);
+                // Only set loading false if we're not loading a project
+                if (!id) {
+                    setLoading(false);
+                }
             } catch (error) {
                 console.error("Auth check failed", error);
                 navigate('/login');
@@ -89,7 +95,59 @@ export default function Studio() {
         };
 
         checkAuth();
-    }, [navigate, API_BASE_URL]);
+    }, [navigate, API_BASE_URL, id]);
+
+    // LOAD PROJECT (if ID in URL)
+    useEffect(() => {
+        if (!id) return; // If no ID, starting a blank project
+
+        const loadProject = async () => {
+            const accessToken = localStorage.getItem('accessToken');
+            if (!accessToken) return;
+
+            try {
+                setLoading(true);
+                const res = await fetch(`${API_BASE_URL}/api/music/projects/${id}/`, {
+                    headers: { 'Authorization': `Bearer ${accessToken}` }
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+
+                    // 1. Set Meta Data
+                    setProjectId(data.id);
+                    setProjectTitle(data.title);
+                    setBpm(data.bpm);
+
+                    // 2. Load Tracks & Clips
+                    if (data.arrangement_json && data.arrangement_json.tracks) {
+                        const loadedTracks: Track[] = data.arrangement_json.tracks;
+                        setTracks(loadedTracks);
+
+                        // 3. Pre-load Audio into Tone.js
+                        loadedTracks.forEach(track => {
+                            track.clips.forEach(clip => {
+                                if (clip.url && !playersRef.current.has(clip.id)) {
+                                    const player = new Tone.Player(clip.url).toDestination();
+                                    playersRef.current.set(clip.id, player);
+                                }
+                            });
+                        });
+                    }
+                } else {
+                    console.error("Failed to load project");
+                    navigate('/studio'); // Redirect if not found
+                }
+            } catch (error) {
+                console.error("Error loading project:", error);
+                navigate('/studio');
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        loadProject();
+    }, [id, navigate, API_BASE_URL]);
 
     // 1. INITIALIZE ENGINE
     useEffect(() => {
@@ -120,13 +178,24 @@ export default function Studio() {
         }
     }, []);
 
+    // Helper: Stop all playing audio
+    const stopAllPlayers = () => {
+        playersRef.current.forEach(player => {
+            if (player.state === "started") {
+                player.stop();
+            }
+        });
+    };
+
     // 3. PLAYBACK LOGIC
     const handlePlay = async () => {
         await Tone.start();
 
         if (isPlaying) {
+            // STOP: Cancel transport and stop all players
             Tone.Transport.stop();
             Tone.Transport.cancel();
+            stopAllPlayers(); // Stop all audio that's currently playing
             if (animationFrameRef.current) {
                 cancelAnimationFrame(animationFrameRef.current);
             }
@@ -134,9 +203,10 @@ export default function Studio() {
             setCurrentTime(0);
             Tone.Transport.seconds = 0;
         } else {
+            // PLAY: Schedule all clips
             Tone.Transport.cancel();
+            stopAllPlayers(); // Ensure nothing is playing before we start
 
-            // Schedule all clips
             tracks.forEach(track => {
                 if (track.isMuted) return;
 
@@ -189,9 +259,14 @@ export default function Studio() {
                         : t
                 ));
             }
+            // Stop everything
+            Tone.Transport.stop();
+            Tone.Transport.cancel();
+            stopAllPlayers(); // Stop all audio
             setIsPlaying(false);
             setIsRecording(false);
-            Tone.Transport.stop();
+            setCurrentTime(0);
+            Tone.Transport.seconds = 0;
             if (animationFrameRef.current) {
                 cancelAnimationFrame(animationFrameRef.current);
             }
@@ -200,6 +275,7 @@ export default function Studio() {
             // START RECORDING
             await Tone.start();
             await micRef.current?.open();
+            stopAllPlayers(); // Ensure nothing is playing
             setRecordStartTime(Tone.Transport.seconds);
             recorderRef.current?.start();
             Tone.Transport.start();
@@ -244,17 +320,27 @@ export default function Studio() {
 
     // 8. CLEAR ALL
     const clearAll = () => {
-        if (isPlaying) {
-            Tone.Transport.stop();
-            setIsPlaying(false);
+        // Stop everything first
+        Tone.Transport.stop();
+        Tone.Transport.cancel();
+        stopAllPlayers();
+        setIsPlaying(false);
+        setIsRecording(false);
+        if (animationFrameRef.current) {
+            cancelAnimationFrame(animationFrameRef.current);
         }
+        
+        // Reset tracks
         setTracks([
             { id: "1", name: "Beat (Imported)", isMuted: false, clips: [] },
             { id: "2", name: "Vocals", isMuted: false, clips: [] }
         ]);
+        
+        // Dispose all players
         playersRef.current.forEach(p => p.dispose());
         playersRef.current.clear();
         setCurrentTime(0);
+        Tone.Transport.seconds = 0;
     };
 
     // 9. SAVE PROJECT
@@ -394,6 +480,164 @@ export default function Studio() {
         return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
     };
 
+    // 11. DRAG & DROP CLIP REPOSITIONING
+    const handleClipMouseDown = (e: React.MouseEvent, trackId: string, clip: Clip) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragState({
+            clipId: clip.id,
+            trackId: trackId,
+            startX: e.clientX,
+            originalStartTime: clip.startTime
+        });
+    };
+
+    const handleMouseMove = useCallback((e: MouseEvent) => {
+        if (!dragState) return;
+
+        const deltaX = e.clientX - dragState.startX;
+        const deltaTime = deltaX / PX_PER_SEC;
+        const newStartTime = Math.max(0, dragState.originalStartTime + deltaTime);
+
+        setTracks(prev => prev.map(track =>
+            track.id === dragState.trackId
+                ? {
+                    ...track,
+                    clips: track.clips.map(clip =>
+                        clip.id === dragState.clipId
+                            ? { ...clip, startTime: newStartTime }
+                            : clip
+                    )
+                }
+                : track
+        ));
+    }, [dragState]);
+
+    const handleMouseUp = useCallback(() => {
+        setDragState(null);
+    }, []);
+
+    // Global mouse event listeners for drag
+    useEffect(() => {
+        if (dragState) {
+            window.addEventListener('mousemove', handleMouseMove);
+            window.addEventListener('mouseup', handleMouseUp);
+            return () => {
+                window.removeEventListener('mousemove', handleMouseMove);
+                window.removeEventListener('mouseup', handleMouseUp);
+            };
+        }
+    }, [dragState, handleMouseMove, handleMouseUp]);
+
+    // 12. SAVE AND REDIRECT (update URL after creating new project)
+    const saveProjectAndRedirect = async () => {
+        const accessToken = localStorage.getItem('accessToken');
+        if (!accessToken) {
+            alert("You must be logged in to save!");
+            return;
+        }
+
+        setIsSaving(true);
+
+        try {
+            const projectPayload = {
+                title: projectTitle,
+                bpm: bpm,
+                arrangement_json: { tracks }
+            };
+
+            let savedProjectId = projectId;
+
+            if (projectId) {
+                // Update existing project
+                await fetch(`${API_BASE_URL}/api/music/projects/${projectId}/`, {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(projectPayload)
+                });
+            } else {
+                // Create new project
+                const res = await fetch(`${API_BASE_URL}/api/music/projects/`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(projectPayload)
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    savedProjectId = data.id;
+                    setProjectId(data.id);
+                }
+            }
+
+            // Upload any blob URLs as files
+            if (savedProjectId) {
+                const updatedTracks = [...tracks];
+                
+                for (const track of updatedTracks) {
+                    for (const clip of track.clips) {
+                        if (clip.url.startsWith('blob:') && !clip.fileId) {
+                            const blob = await fetch(clip.url).then(r => r.blob());
+                            const formData = new FormData();
+                            formData.append('file', blob, `${clip.name}.webm`);
+                            formData.append('name', clip.name);
+                            formData.append('duration', clip.duration.toString());
+
+                            const uploadRes = await fetch(
+                                `${API_BASE_URL}/api/music/projects/${savedProjectId}/upload/`,
+                                {
+                                    method: 'POST',
+                                    headers: { 'Authorization': `Bearer ${accessToken}` },
+                                    body: formData
+                                }
+                            );
+
+                            if (uploadRes.ok) {
+                                const fileData = await uploadRes.json();
+                                clip.fileId = fileData.id;
+                                clip.url = fileData.file_url;
+                            }
+                        }
+                    }
+                }
+
+                // Save the updated arrangement with file URLs
+                await fetch(`${API_BASE_URL}/api/music/projects/${savedProjectId}/`, {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        title: projectTitle,
+                        bpm: bpm,
+                        arrangement_json: { tracks: updatedTracks }
+                    })
+                });
+
+                setTracks(updatedTracks);
+            }
+
+            alert("Project saved successfully!");
+
+            // Redirect to /studio/:id if this was a new project
+            if (savedProjectId && !id) {
+                navigate(`/studio/${savedProjectId}`, { replace: true });
+            }
+        } catch (error) {
+            console.error("Failed to save project:", error);
+            alert("Error saving project.");
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
     if (loading) {
         return (
             <div className="min-h-screen bg-black flex items-center justify-center">
@@ -495,7 +739,7 @@ export default function Studio() {
 
                     {/* Save Button */}
                     <button
-                        onClick={saveProject}
+                        onClick={saveProjectAndRedirect}
                         disabled={isSaving}
                         className="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded-lg font-medium transition-colors disabled:opacity-50"
                     >
@@ -601,15 +845,24 @@ export default function Studio() {
                                 {track.clips.map(clip => (
                                     <div
                                         key={clip.id}
-                                        className="absolute h-20 top-2 rounded-lg overflow-hidden border border-blue-400/50 group cursor-pointer"
+                                        onMouseDown={(e) => handleClipMouseDown(e, track.id, clip)}
+                                        className={`absolute h-20 top-2 rounded-lg overflow-hidden border group select-none ${
+                                            dragState?.clipId === clip.id 
+                                                ? 'border-yellow-400 shadow-lg shadow-yellow-500/30 cursor-grabbing z-50' 
+                                                : 'border-blue-400/50 cursor-grab'
+                                        }`}
                                         style={{
                                             left: `${clip.startTime * PX_PER_SEC}px`,
                                             width: `${clip.duration * PX_PER_SEC}px`,
-                                            background: 'linear-gradient(180deg, rgba(59, 130, 246, 0.8) 0%, rgba(59, 130, 246, 0.4) 100%)'
+                                            background: dragState?.clipId === clip.id
+                                                ? 'linear-gradient(180deg, rgba(234, 179, 8, 0.8) 0%, rgba(234, 179, 8, 0.4) 100%)'
+                                                : 'linear-gradient(180deg, rgba(59, 130, 246, 0.8) 0%, rgba(59, 130, 246, 0.4) 100%)'
                                         }}
                                     >
                                         {/* Clip Header */}
-                                        <div className="bg-blue-600/80 px-2 py-1 text-xs font-medium truncate flex justify-between items-center">
+                                        <div className={`px-2 py-1 text-xs font-medium truncate flex justify-between items-center ${
+                                            dragState?.clipId === clip.id ? 'bg-yellow-600/80' : 'bg-blue-600/80'
+                                        }`}>
                                             <span>{clip.name}</span>
                                             <button
                                                 onClick={(e) => {
@@ -623,7 +876,7 @@ export default function Studio() {
                                         </div>
 
                                         {/* Waveform Placeholder */}
-                                        <div className="h-full flex items-center justify-center">
+                                        <div className="h-full flex items-center justify-center pointer-events-none">
                                             <div className="flex items-end gap-0.5 h-8">
                                                 {Array.from({ length: Math.min(Math.floor(clip.duration * 10), 50) }).map((_, i) => (
                                                     <div
@@ -633,6 +886,11 @@ export default function Studio() {
                                                     />
                                                 ))}
                                             </div>
+                                        </div>
+
+                                        {/* Time Position Label */}
+                                        <div className="absolute bottom-1 left-2 text-xs text-white/60">
+                                            {clip.startTime.toFixed(1)}s
                                         </div>
 
                                         {/* Duration Label */}
