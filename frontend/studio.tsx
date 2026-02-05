@@ -2,9 +2,16 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import * as Tone from "tone";
 import Logo from './components/Logo';
+import { generateWaveform } from './utils/waveform';
 
 // CONSTANTS
 const PX_PER_SEC = 50; // 1 second = 50 pixels wide
+const SNAP_GRID = 0.25; // Snap resolution in seconds (1/4 note at 120BPM)
+
+// Helper: Snap time to grid
+const snapTime = (rawTime: number): number => {
+    return Math.round(rawTime / SNAP_GRID) * SNAP_GRID;
+};
 
 interface Clip {
     id: string;
@@ -13,6 +20,7 @@ interface Clip {
     startTime: number;     // In Seconds (e.g., 2.5)
     duration: number;      // In Seconds
     name: string;
+    waveformData?: number[]; // Real waveform data for display
 }
 
 interface Track {
@@ -65,6 +73,7 @@ export default function Studio() {
         bpm: "",
         price: "",
         description: "",
+        tags: "",
     });
     const [audioFile, setAudioFile] = useState<File | null>(null);
     const [coverArt, setCoverArt] = useState<File | null>(null);
@@ -340,13 +349,20 @@ export default function Studio() {
                 const buffer = await new Tone.ToneAudioBuffer().load(url);
                 const duration = buffer.duration;
 
+                // Generate real waveform data
+                const waveformData = await generateWaveform(url);
+
+                // Snap start time to grid
+                const snappedStartTime = snapTime(recordStartTime);
+
                 // Add the new Clip to the selected track
                 const newClip: Clip = {
                     id: crypto.randomUUID(),
                     url,
-                    startTime: recordStartTime,
+                    startTime: snappedStartTime,
                     duration: duration,
-                    name: `Recording ${new Date().toLocaleTimeString()}`
+                    name: `Recording ${new Date().toLocaleTimeString()}`,
+                    waveformData
                 };
 
                 setTracks(prev => prev.map(t =>
@@ -373,7 +389,8 @@ export default function Studio() {
             await Tone.start();
             await micRef.current?.open();
             stopAllPlayers();
-            setRecordStartTime(Tone.Transport.seconds);
+            // Snap the recording start time to grid
+            setRecordStartTime(snapTime(Tone.Transport.seconds));
             recorderRef.current?.start();
             
             // Start metronome if enabled
@@ -416,12 +433,23 @@ export default function Studio() {
 
     // 7. DELETE CLIP
     const deleteClip = (trackId: string, clipId: string) => {
+        // 1. Find the clip to clean up memory
+        const track = tracks.find(t => t.id === trackId);
+        const clip = track?.clips.find(c => c.id === clipId);
+        
+        // 2. Revoke blob URL to free memory
+        if (clip && clip.url.startsWith('blob:')) {
+            URL.revokeObjectURL(clip.url);
+        }
+
+        // 3. Remove from state
         setTracks(tracks.map(t =>
             t.id === trackId
                 ? { ...t, clips: t.clips.filter(c => c.id !== clipId) }
                 : t
         ));
-        // Cleanup player
+        
+        // 4. Dispose player
         const player = playersRef.current.get(clipId);
         if (player) {
             player.dispose();
@@ -441,6 +469,15 @@ export default function Studio() {
         if (animationFrameRef.current) {
             cancelAnimationFrame(animationFrameRef.current);
         }
+        
+        // Revoke all blob URLs to free memory
+        tracks.forEach(track => {
+            track.clips.forEach(clip => {
+                if (clip.url.startsWith('blob:')) {
+                    URL.revokeObjectURL(clip.url);
+                }
+            });
+        });
         
         // Reset tracks
         setTracks([
@@ -566,12 +603,16 @@ export default function Studio() {
         const url = URL.createObjectURL(file);
         const buffer = await new Tone.ToneAudioBuffer().load(url);
 
+        // Generate real waveform data
+        const waveformData = await generateWaveform(url);
+
         const newClip: Clip = {
             id: crypto.randomUUID(),
             url,
             startTime: 0,
             duration: buffer.duration,
-            name: file.name
+            name: file.name,
+            waveformData
         };
 
         setTracks(prev => prev.map(t =>
@@ -626,8 +667,23 @@ export default function Studio() {
     }, [dragState]);
 
     const handleMouseUp = useCallback(() => {
+        // Snap clip to grid on drop
+        if (dragState) {
+            setTracks(prev => prev.map(track =>
+                track.id === dragState.trackId
+                    ? {
+                        ...track,
+                        clips: track.clips.map(clip =>
+                            clip.id === dragState.clipId
+                                ? { ...clip, startTime: snapTime(clip.startTime) }
+                                : clip
+                        )
+                    }
+                    : track
+            ));
+        }
         setDragState(null);
-    }, []);
+    }, [dragState]);
 
     // Global mouse event listeners for drag
     useEffect(() => {
@@ -657,6 +713,7 @@ export default function Studio() {
         if (uploadForm.bpm) formData.append('bpm', uploadForm.bpm);
         if (uploadForm.price) formData.append('price', uploadForm.price);
         formData.append('description', uploadForm.description);
+        if (uploadForm.tags) formData.append('tags', uploadForm.tags);
         
         // Append files
         formData.append('audio_file', audioFile);
@@ -675,7 +732,7 @@ export default function Studio() {
             if (res.ok) {
                 alert("Track uploaded successfully!");
                 // Reset form
-                setUploadForm({ title: "", genre: "", bpm: "", price: "", description: "" });
+                setUploadForm({ title: "", genre: "", bpm: "", price: "", description: "", tags: "" });
                 setAudioFile(null);
                 setCoverArt(null);
                 navigate('/');
@@ -1127,14 +1184,14 @@ export default function Studio() {
                                             </button>
                                         </div>
 
-                                        {/* Waveform Placeholder */}
-                                        <div className="h-full flex items-center justify-center pointer-events-none">
-                                            <div className="flex items-end gap-0.5 h-8">
-                                                {Array.from({ length: Math.min(Math.floor(clip.duration * 10), 50) }).map((_, i) => (
+                                        {/* Real Waveform Display */}
+                                        <div className="h-full flex items-center pointer-events-none px-1">
+                                            <div className="flex items-center gap-px h-10 w-full">
+                                                {(clip.waveformData || Array(50).fill(0.2)).map((val, i) => (
                                                     <div
                                                         key={i}
-                                                        className="w-1 bg-white/40 rounded-full"
-                                                        style={{ height: `${Math.random() * 100}%` }}
+                                                        className="flex-1 bg-white/60 rounded-full min-w-[1px]"
+                                                        style={{ height: `${Math.max(val * 100, 10)}%` }}
                                                     />
                                                 ))}
                                             </div>
@@ -1178,29 +1235,59 @@ export default function Studio() {
                         </h2>
                         
                         <form onSubmit={handleUploadSubmit} className="space-y-6">
-                            {/* File Inputs */}
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                <div className="space-y-2">
-                                    <label className="block text-sm font-medium text-gray-300">Audio File *</label>
+                            {/* Audio File - Drag & Drop Zone */}
+                            <div className="space-y-2">
+                                <label className="block text-sm font-medium text-gray-300">Audio File *</label>
+                                <div className="relative group">
                                     <input 
                                         type="file" 
                                         accept="audio/*"
                                         onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
-                                        className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-500"
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                                         required
                                     />
-                                    {audioFile && <p className="text-xs text-green-400">Selected: {audioFile.name}</p>}
+                                    <div className={`
+                                        border-2 border-dashed rounded-xl p-8 text-center transition-all
+                                        ${audioFile ? 'border-green-500 bg-green-500/10' : 'border-white/10 group-hover:border-blue-500 bg-white/5'}
+                                    `}>
+                                        {audioFile ? (
+                                            <div className="text-green-400 font-medium">
+                                                ✅ Selected: {audioFile.name}
+                                            </div>
+                                        ) : (
+                                            <div className="text-gray-400">
+                                                <span className="text-2xl block mb-2">📂</span>
+                                                <span className="font-medium text-white">Click to browse</span> or drag file here
+                                                <p className="text-xs mt-1 text-gray-500">MP3 or WAV (Max 50MB)</p>
+                                            </div>
+                                        )}
+                                    </div>
                                 </div>
-                                <div className="space-y-2">
-                                    <label className="block text-sm font-medium text-gray-300">Cover Art</label>
-                                    <input 
-                                        type="file" 
-                                        accept="image/*"
-                                        onChange={(e) => setCoverArt(e.target.files?.[0] || null)}
-                                        className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gray-700 file:text-white hover:file:bg-gray-600"
-                                    />
-                                    {coverArt && <p className="text-xs text-green-400">Selected: {coverArt.name}</p>}
-                                </div>
+                                {/* Audio Preview */}
+                                {audioFile && (
+                                    <div className="mt-2 bg-gray-800 p-3 rounded-lg flex items-center gap-3">
+                                        <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center">
+                                            🎵
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <p className="text-sm font-medium truncate">{audioFile.name}</p>
+                                            <p className="text-xs text-gray-400">{(audioFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                                        </div>
+                                        <audio controls src={URL.createObjectURL(audioFile)} className="h-8 w-32" />
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Cover Art */}
+                            <div className="space-y-2">
+                                <label className="block text-sm font-medium text-gray-300">Cover Art</label>
+                                <input 
+                                    type="file" 
+                                    accept="image/*"
+                                    onChange={(e) => setCoverArt(e.target.files?.[0] || null)}
+                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gray-700 file:text-white hover:file:bg-gray-600"
+                                />
+                                {coverArt && <p className="text-xs text-green-400">Selected: {coverArt.name}</p>}
                             </div>
 
                             {/* Metadata Inputs */}
@@ -1221,18 +1308,18 @@ export default function Studio() {
                                     <select 
                                         value={uploadForm.genre}
                                         onChange={(e) => setUploadForm({...uploadForm, genre: e.target.value})}
-                                        className="w-full bg-gray-800 text-white border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                        className="w-full bg-gray-900 text-white border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
                                     >
-                                        <option value="" className="bg-gray-800 text-white">Select Genre</option>
-                                        <option value="Hip Hop" className="bg-gray-800 text-white">Hip Hop</option>
-                                        <option value="Trap" className="bg-gray-800 text-white">Trap</option>
-                                        <option value="R&B" className="bg-gray-800 text-white">R&B</option>
-                                        <option value="Pop" className="bg-gray-800 text-white">Pop</option>
-                                        <option value="Electronic" className="bg-gray-800 text-white">Electronic</option>
-                                        <option value="Rock" className="bg-gray-800 text-white">Rock</option>
-                                        <option value="Jazz" className="bg-gray-800 text-white">Jazz</option>
-                                        <option value="Classical" className="bg-gray-800 text-white">Classical</option>
-                                        <option value="Other" className="bg-gray-800 text-white">Other</option>
+                                        <option value="" className="bg-gray-900 text-white">Select Genre</option>
+                                        <option value="Hip Hop" className="bg-gray-900 text-white">Hip Hop</option>
+                                        <option value="Trap" className="bg-gray-900 text-white">Trap</option>
+                                        <option value="R&B" className="bg-gray-900 text-white">R&B</option>
+                                        <option value="Pop" className="bg-gray-900 text-white">Pop</option>
+                                        <option value="Electronic" className="bg-gray-900 text-white">Electronic</option>
+                                        <option value="Rock" className="bg-gray-900 text-white">Rock</option>
+                                        <option value="Jazz" className="bg-gray-900 text-white">Jazz</option>
+                                        <option value="Classical" className="bg-gray-900 text-white">Classical</option>
+                                        <option value="Other" className="bg-gray-900 text-white">Other</option>
                                     </select>
                                 </div>
                             </div>
@@ -1271,6 +1358,17 @@ export default function Studio() {
                                     onChange={(e) => setUploadForm({...uploadForm, description: e.target.value})}
                                     className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500 h-24 resize-none"
                                     placeholder="Tell us about your track..."
+                                />
+                            </div>
+
+                            <div className="space-y-2">
+                                <label className="block text-sm font-medium text-gray-300">Tags (comma separated)</label>
+                                <input 
+                                    type="text" 
+                                    value={uploadForm.tags}
+                                    onChange={(e) => setUploadForm({...uploadForm, tags: e.target.value})}
+                                    className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                    placeholder="e.g. Dark, Melodic, 140BPM"
                                 />
                             </div>
 
