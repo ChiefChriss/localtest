@@ -26,6 +26,7 @@ interface Track {
   created_at: string;
   likes_count: number;
   is_liked: boolean;
+  listens_count: number;
 }
 
 const Home = () => {
@@ -152,6 +153,22 @@ const Home = () => {
     navigate('/login');
   };
 
+  const handleListenUpdate = (trackId: number, newCount: number) => {
+    // Update tracks in feed
+    setTracks(prev => prev.map(track =>
+      track.id === trackId
+        ? { ...track, listens_count: newCount }
+        : track
+    ));
+
+    // Update search results if active
+    setSearchResults(prev => prev.map(track =>
+      track.id === trackId
+        ? { ...track, listens_count: newCount }
+        : track
+    ));
+  };
+
   const displayTracks = activeView === 'search' ? searchResults : tracks;
 
   if (loading) {
@@ -235,6 +252,7 @@ const Home = () => {
                     key={track.id}
                     track={track}
                     onLike={handleLike}
+                    onListenUpdate={handleListenUpdate}
                   />
                 ))}
               </div>
@@ -263,9 +281,10 @@ const Home = () => {
 interface TrackCardProps {
   track: Track;
   onLike: (trackId: number) => void;
+  onListenUpdate?: (trackId: number, newCount: number) => void;
 }
 
-const TrackCard = ({ track, onLike }: TrackCardProps) => {
+const TrackCard = ({ track, onLike, onListenUpdate }: TrackCardProps) => {
   return (
     <div className="bg-white/5 border border-white/10 rounded-2xl p-4 hover:bg-white/[0.07] transition-colors group">
       <div className="flex items-start gap-4 mb-4">
@@ -317,6 +336,15 @@ const TrackCard = ({ track, onLike }: TrackCardProps) => {
 
           {/* Meta Info */}
           <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
+            {/* Listen Count */}
+            <span className="flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              {track.listens_count}
+            </span>
+            <span>•</span>
             <span>{new Date(track.created_at).toLocaleDateString()}</span>
             {track.genre && (
               <>
@@ -335,7 +363,11 @@ const TrackCard = ({ track, onLike }: TrackCardProps) => {
       </div>
 
       {/* Audio Player */}
-      <AudioPlayer url={track.audio_file} />
+      <AudioPlayer 
+        url={track.audio_file} 
+        trackId={track.id}
+        onListenRecorded={(newCount) => onListenUpdate?.(track.id, newCount)}
+      />
     </div>
   );
 };

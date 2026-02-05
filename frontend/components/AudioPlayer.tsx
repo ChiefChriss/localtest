@@ -3,21 +3,53 @@ import WaveSurfer from 'wavesurfer.js';
 
 interface AudioPlayerProps {
     url: string;
+    trackId?: number;
     height?: number;
     waveColor?: string;
     progressColor?: string;
+    onListenRecorded?: (newCount: number) => void;
 }
 
 const AudioPlayer = ({
     url,
+    trackId,
     height = 50,
     waveColor = '#a855f7', // purple-500
-    progressColor = '#3b82f6' // blue-500
+    progressColor = '#3b82f6', // blue-500
+    onListenRecorded
 }: AudioPlayerProps) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const wavesurfer = useRef<WaveSurfer | null>(null);
     const [isPlaying, setIsPlaying] = useState(false);
     const [loading, setLoading] = useState(true);
+    const hasRecordedListen = useRef(false);
+
+    // Record a listen when track is played
+    const recordListen = async () => {
+        if (!trackId || hasRecordedListen.current) return;
+        
+        hasRecordedListen.current = true;
+        const accessToken = localStorage.getItem('accessToken');
+        const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/music/tracks/${trackId}/listen/`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${accessToken}` }
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                if (onListenRecorded) {
+                    onListenRecorded(data.listens_count);
+                }
+            }
+        } catch (error) {
+            console.error('Failed to record listen:', error);
+            // Reset so it can try again
+            hasRecordedListen.current = false;
+        }
+    };
 
     useEffect(() => {
         if (!containerRef.current) return;
@@ -42,7 +74,11 @@ const AudioPlayer = ({
             setLoading(false);
         });
 
-        wavesurfer.current.on('play', () => setIsPlaying(true));
+        wavesurfer.current.on('play', () => {
+            setIsPlaying(true);
+            // Record listen when track starts playing
+            recordListen();
+        });
         wavesurfer.current.on('pause', () => setIsPlaying(false));
         wavesurfer.current.on('finish', () => setIsPlaying(false));
 

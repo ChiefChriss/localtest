@@ -85,6 +85,26 @@ class LikedTracksView(generics.ListAPIView):
         return Track.objects.filter(likes__user=self.request.user).order_by('-likes__created_at')
 
 
+class TrackListenView(APIView):
+    """Record a listen/play for a track"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, track_id):
+        try:
+            track = Track.objects.get(id=track_id)
+        except Track.DoesNotExist:
+            return Response({'error': 'Track not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Increment the listen count
+        track.listens_count += 1
+        track.save(update_fields=['listens_count'])
+        
+        return Response({
+            'success': True, 
+            'listens_count': track.listens_count
+        })
+
+
 class ProjectListCreateView(generics.ListCreateAPIView):
     """
     GET: List all my projects

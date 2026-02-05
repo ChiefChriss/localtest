@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import axios from "axios";
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import * as Tone from "tone";
 import Logo from './components/Logo';
 
@@ -12,15 +12,62 @@ const INITIAL_GRID = [
     { name: "Synth", note: "C4", active: [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0] },
 ];
 
+// Helper to create a fresh empty grid
+const createEmptyGrid = () => [
+    { name: "Kick", note: "C2", active: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+    { name: "Snare", note: "D2", active: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+    { name: "HiHat", note: "G2", active: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+    { name: "Synth", note: "C4", active: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+];
+
 export default function Studio() {
+    const navigate = useNavigate();
     const [grid, setGrid] = useState(INITIAL_GRID);
     const [isPlaying, setIsPlaying] = useState(false);
     const [currentStep, setCurrentStep] = useState(0);
     const [projectName, setProjectName] = useState("My New Beat");
+    const [loading, setLoading] = useState(true);
+
+    const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+
+    // Authentication check on mount
+    useEffect(() => {
+        const checkAuth = async () => {
+            const accessToken = localStorage.getItem('accessToken');
+            if (!accessToken) {
+                navigate('/login');
+                return;
+            }
+
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/auth/profile/`, {
+                    headers: { 'Authorization': `Bearer ${accessToken}` }
+                });
+
+                if (!res.ok) {
+                    navigate('/login');
+                    return;
+                }
+
+                const profile = await res.json();
+                // Check if user is a creator
+                if (!profile.is_creator) {
+                    navigate('/');
+                    return;
+                }
+
+                setLoading(false);
+            } catch (error) {
+                console.error("Auth check failed", error);
+                navigate('/login');
+            }
+        };
+
+        checkAuth();
+    }, [navigate, API_BASE_URL]);
 
     const saveProject = async () => {
         const token = localStorage.getItem("accessToken");
-        const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
         if (!token) {
             alert("You must be logged in to save!");
@@ -122,6 +169,26 @@ export default function Studio() {
         setGrid(newGrid);
     };
 
+    // 5. Clear Grid
+    const clearGrid = () => {
+        // Stop playback if playing
+        if (isPlaying) {
+            Tone.Transport.stop();
+            setIsPlaying(false);
+        }
+        setCurrentStep(0);
+        setGrid(createEmptyGrid());
+    };
+
+    // Show loading state while checking auth
+    if (loading) {
+        return (
+            <div className="min-h-screen bg-black flex items-center justify-center">
+                <div className="w-8 h-8 border-2 border-purple-500 rounded-full animate-spin border-t-transparent"></div>
+            </div>
+        );
+    }
+
     return (
         <div className="flex bg-black text-white min-h-screen">
             {/* Sidebar - Retaining navigation from previous setup */}
@@ -212,7 +279,10 @@ export default function Studio() {
                     </div>
 
                     <div className="mt-8 flex justify-end">
-                        <button className="bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white px-6 py-2 rounded-xl text-sm font-medium transition-colors border border-white/5">
+                        <button 
+                            onClick={clearGrid}
+                            className="bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white px-6 py-2 rounded-xl text-sm font-medium transition-colors border border-white/5"
+                        >
                             Clear Grid
                         </button>
                     </div>

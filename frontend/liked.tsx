@@ -25,6 +25,7 @@ interface Track {
   created_at: string;
   likes_count: number;
   is_liked: boolean;
+  listens_count: number;
 }
 
 const Liked = () => {
@@ -100,6 +101,14 @@ const Liked = () => {
     localStorage.removeItem('refreshToken');
     localStorage.removeItem('username');
     navigate('/login');
+  };
+
+  const handleListenUpdate = (trackId: number, newCount: number) => {
+    setLikedTracks(prev => prev.map(track =>
+      track.id === trackId
+        ? { ...track, listens_count: newCount }
+        : track
+    ));
   };
 
   if (loading) {
@@ -262,6 +271,15 @@ const Liked = () => {
 
                         {/* Meta Info */}
                         <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
+                          {/* Listen Count */}
+                          <span className="flex items-center gap-1">
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            {track.listens_count}
+                          </span>
+                          <span>•</span>
                           <span>{new Date(track.created_at).toLocaleDateString()}</span>
                           {track.genre && (
                             <>
@@ -280,7 +298,11 @@ const Liked = () => {
                     </div>
 
                     {/* Audio Player */}
-                    <AudioPlayer url={track.audio_file} />
+                    <AudioPlayer 
+                      url={track.audio_file} 
+                      trackId={track.id}
+                      onListenRecorded={(newCount) => handleListenUpdate(track.id, newCount)}
+                    />
                   </div>
                 ))}
               </div>
