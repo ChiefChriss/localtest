@@ -275,28 +275,60 @@ export default function Studio() {
     const handleMouseUp = () => {
         if (!dragState) return;
 
+        // 1. Calculate Time Change
         const deltaPixels = dragState.currentX - dragState.startX;
         const deltaTime = deltaPixels / PX_PER_SEC;
-        
-        const newTracks = tracks.map(track => {
-            if (track.id !== dragState.fromTrackId) return track;
-            return {
-                ...track,
-                clips: track.clips.map(clip => {
-                    if (clip.id !== dragState.clipId) return clip;
 
-                    if (dragState.type === 'MOVE') {
-                        const rawNewTime = dragState.originalStart + deltaTime;
-                        const newTime = Math.max(0, Math.round(rawNewTime / SNAP_GRID) * SNAP_GRID);
-                        return { ...clip, startTime: newTime };
-                    }
-                    if (dragState.type === 'RESIZE_R') {
-                        const rawNewDur = dragState.originalDuration + deltaTime;
-                        return { ...clip, duration: Math.max(0.1, rawNewDur) };
-                    }
-                    return clip;
-                })
-            };
+        // 2. Identify Target Track (Vertical Drag)
+        // Header is ~56px (h-14), each track is 128px (h-32)
+        const headerHeight = 56; 
+        const trackHeight = 128; 
+        const relativeY = dragState.currentY - headerHeight;
+        const trackIndex = Math.floor(relativeY / trackHeight);
+        
+        let targetTrackId = dragState.fromTrackId;
+        if (trackIndex >= 0 && trackIndex < tracks.length) {
+            targetTrackId = tracks[trackIndex].id;
+        }
+
+        const newTracks = tracks.map(track => {
+            // Remove clip from old track if moving to different track
+            if (track.id === dragState.fromTrackId && track.id !== targetTrackId) {
+                return { ...track, clips: track.clips.filter(c => c.id !== dragState.clipId) };
+            }
+
+            // Add/Update clip in target track
+            if (track.id === targetTrackId) {
+                // If it's a move within the same track, find and update
+                if (dragState.fromTrackId === targetTrackId) {
+                    return {
+                        ...track,
+                        clips: track.clips.map(clip => {
+                            if (clip.id !== dragState.clipId) return clip;
+                            if (dragState.type === 'MOVE') {
+                                const rawNewTime = dragState.originalStart + deltaTime;
+                                return { ...clip, startTime: Math.max(0, Math.round(rawNewTime / SNAP_GRID) * SNAP_GRID) };
+                            }
+                            if (dragState.type === 'RESIZE_R') {
+                                return { ...clip, duration: Math.max(0.1, dragState.originalDuration + deltaTime) };
+                            }
+                            return clip;
+                        })
+                    };
+                }
+
+                // If moving from a DIFFERENT track, find the clip and move it here
+                const clipToMove = tracks.find(t => t.id === dragState.fromTrackId)?.clips.find(c => c.id === dragState.clipId);
+                if (clipToMove) {
+                    const rawNewTime = dragState.originalStart + deltaTime;
+                    const movedClip = { 
+                        ...clipToMove, 
+                        startTime: Math.max(0, Math.round(rawNewTime / SNAP_GRID) * SNAP_GRID) 
+                    };
+                    return { ...track, clips: [...track.clips, movedClip] };
+                }
+            }
+            return track;
         });
 
         setTracks(newTracks);
