@@ -1,9 +1,9 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from .models import Track, Like, Project
-from .serializers import TrackSerializer, LikeSerializer, ProjectSerializer
-from rest_framework.parsers import MultiPartParser, FormParser
+from .models import Track, Like, Project, ProjectFile
+from .serializers import TrackSerializer, LikeSerializer, ProjectSerializer, ProjectFileSerializer
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.utils import timezone
 from datetime import timedelta
 from django.db.models import Q
@@ -130,3 +130,48 @@ class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         return Project.objects.filter(user=self.request.user)
+
+
+class ProjectFileUploadView(APIView):
+    """
+    Upload an audio file (recording/stem) to a project.
+    Returns the file ID and URL so frontend can reference it in arrangement_json.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, project_id):
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        file = request.FILES.get('file')
+        if not file:
+            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        name = request.data.get('name', 'Recording')
+        duration = request.data.get('duration')
+
+        project_file = ProjectFile.objects.create(
+            project=project,
+            name=name,
+            file=file,
+            duration=float(duration) if duration else None
+        )
+
+        serializer = ProjectFileSerializer(project_file, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class ProjectFileListView(generics.ListAPIView):
+    """List all audio files for a specific project"""
+    serializer_class = ProjectFileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        project_id = self.kwargs.get('project_id')
+        return ProjectFile.objects.filter(
+            project_id=project_id,
+            project__user=self.request.user
+        ).order_by('-created_at')

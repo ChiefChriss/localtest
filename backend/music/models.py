@@ -41,13 +41,33 @@ class Repost(models.Model):
 
 
 class Project(models.Model):
-    """Stores the raw DAW state (JSON) so users can edit beats later"""
+    """
+    Stores the DAW project state for a linear timeline-based arrangement.
+    The arrangement_json stores the layout of tracks and clips.
+    Structure: { "tracks": [ { "id": "1", "name": "Vocals", "isMuted": false, "clips": [...] } ] }
+    """
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='projects')
     title = models.CharField(max_length=255, default="Untitled Project")
     bpm = models.IntegerField(default=120)
-    # This JSONField stores the React Grid state
-    grid_data = models.JSONField(default=dict) 
+    # Stores the layout: "Track 1 has a clip at 3.5 seconds"
+    arrangement_json = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
     last_updated = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"Project: {self.title} by {self.user.username}"
+
+
+class ProjectFile(models.Model):
+    """
+    Stores the actual raw audio files (blobs) for vocals/recordings.
+    The 'arrangement_json' in Project will reference these files by their ID or URL.
+    """
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='audio_files')
+    name = models.CharField(max_length=255, default="Recording")
+    file = models.FileField(upload_to='project_stems/')
+    duration = models.FloatField(null=True, blank=True, help_text="Duration in seconds")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.name} - {self.project.title}"

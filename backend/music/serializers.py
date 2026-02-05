@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Track, Like, Project
+from .models import Track, Like, Project, ProjectFile
 
 class TrackSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.username')
@@ -48,8 +48,25 @@ class LikeSerializer(serializers.ModelSerializer):
         read_only_fields = ['user', 'created_at']
 
 
+class ProjectFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectFile
+        fields = ['id', 'project', 'name', 'file', 'file_url', 'duration', 'created_at']
+        read_only_fields = ['created_at']
+
+    def get_file_url(self, obj):
+        request = self.context.get('request')
+        if obj.file and request:
+            return request.build_absolute_uri(obj.file.url)
+        return None
+
+
 class ProjectSerializer(serializers.ModelSerializer):
+    audio_files = ProjectFileSerializer(many=True, read_only=True)
+
     class Meta:
         model = Project
-        fields = ['id', 'user', 'title', 'bpm', 'grid_data', 'last_updated']
-        read_only_fields = ['user', 'last_updated']
+        fields = ['id', 'user', 'title', 'bpm', 'arrangement_json', 'audio_files', 'created_at', 'last_updated']
+        read_only_fields = ['user', 'created_at', 'last_updated']
