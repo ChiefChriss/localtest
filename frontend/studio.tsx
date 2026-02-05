@@ -196,12 +196,12 @@ export default function Studio() {
         } catch (e) { console.error(e); }
     };
 
-    // --- 3. AUDIO ENGINE SYNC (Core Logic - Only updates on state commit) ---
+    // --- 3. AUDIO ENGINE SYNC (Channels only - Players created on demand) ---
     useEffect(() => {
         Tone.Transport.bpm.value = bpm;
 
         tracks.forEach(track => {
-            // A. Create/Update Channel (Volume/Pan)
+            // Create/Update Channel (Volume/Pan)
             if (!channelsRef.current.has(track.id)) {
                 const channel = new Tone.Channel({ volume: track.volume, pan: track.pan, mute: track.isMuted, solo: track.isSolo }).toDestination();
                 channelsRef.current.set(track.id, channel);
@@ -212,26 +212,11 @@ export default function Studio() {
             channel.mute = track.isMuted;
             channel.solo = track.isSolo;
 
-            // B. Sync Players
+            // Pre-load players (but don't sync yet - we do that on play)
             track.clips.forEach(clip => {
                 if (!playersRef.current.has(clip.id)) {
-                    const player = new Tone.Player({
-                        url: clip.url,
-                        onload: () => {
-                            player.sync().start(clip.startTime).stop(clip.startTime + clip.duration);
-                        }
-                    }).connect(channel);
+                    const player = new Tone.Player(clip.url).connect(channel);
                     playersRef.current.set(clip.id, player);
-                } else {
-                    const player = playersRef.current.get(clip.id)!;
-                    if (player.state !== "started") {
-                        try {
-                            player.unsync();
-                            player.sync().start(clip.startTime).stop(clip.startTime + clip.duration);
-                        } catch (e) {
-                            // Clip might be disposed or invalid
-                        }
-                    }
                 }
             });
         });
@@ -240,12 +225,50 @@ export default function Studio() {
     // --- 4. PLAYBACK CONTROLS ---
     const handlePlay = async () => {
         await Tone.start();
-        await Tone.loaded();
         
         if (isPlaying) {
+            // Pause
             Tone.Transport.pause();
+            playersRef.current.forEach(p => {
+                try { p.stop(); } catch(e) {}
+            });
             setIsPlaying(false);
         } else {
+            // Stop any existing playback first
+            Tone.Transport.stop();
+            Tone.Transport.cancel();
+            playersRef.current.forEach(p => {
+                try { 
+                    p.stop();
+                    p.unsync();
+                } catch(e) {}
+            });
+
+            // Wait for all audio to load
+            await Tone.loaded();
+
+            // Schedule all clips on Transport
+            tracks.forEach(track => {
+                if (track.isMuted) return;
+                
+                const channel = channelsRef.current.get(track.id);
+                
+                track.clips.forEach(clip => {
+                    const player = playersRef.current.get(clip.id);
+                    if (player && player.loaded) {
+                        // Ensure player is connected to the right channel
+                        player.disconnect();
+                        player.connect(channel!);
+                        
+                        // Schedule this clip
+                        Tone.Transport.schedule((time) => {
+                            player.start(time, 0, clip.duration);
+                        }, clip.startTime);
+                    }
+                });
+            });
+
+            // Start playback
             Tone.Transport.start();
             setIsPlaying(true);
             requestAnimationFrame(updatePlayhead);
@@ -254,9 +277,16 @@ export default function Studio() {
 
     const handleStop = () => {
         Tone.Transport.stop();
+        Tone.Transport.cancel();
+        Tone.Transport.seconds = 0;
+        playersRef.current.forEach(p => {
+            try { 
+                p.stop();
+                p.unsync();
+            } catch(e) {}
+        });
         setIsPlaying(false);
         setCurrentTime(0);
-        playersRef.current.forEach(p => p.stop());
     };
 
     const updatePlayhead = () => {
