@@ -19,6 +19,9 @@ interface Track {
     id: string;
     name: string;
     isMuted: boolean;
+    isSolo: boolean;    // Solo this track
+    volume: number;     // -60 to 0 dB
+    pan: number;        // -1 (Left) to 1 (Right)
     clips: Clip[];
 }
 
@@ -36,8 +39,8 @@ export default function Studio() {
 
     // STATE
     const [tracks, setTracks] = useState<Track[]>([
-        { id: "1", name: "Beat (Imported)", isMuted: false, clips: [] },
-        { id: "2", name: "Vocals", isMuted: false, clips: [] }
+        { id: "1", name: "Beat", isMuted: false, isSolo: false, volume: -5, pan: 0, clips: [] },
+        { id: "2", name: "Vocals", isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }
     ]);
     const [selectedTrackId, setSelectedTrackId] = useState<string>("2");
     const [isPlaying, setIsPlaying] = useState(false);
@@ -50,14 +53,33 @@ export default function Studio() {
     const [isSaving, setIsSaving] = useState(false);
     const [recordStartTime, setRecordStartTime] = useState(0);
     const [dragState, setDragState] = useState<DragState | null>(null);
+    const [isMetronomeOn, setIsMetronomeOn] = useState(false);
+
+    // TAB STATE (Create vs Upload)
+    const [activeTab, setActiveTab] = useState<'create' | 'upload'>('create');
+
+    // UPLOAD TAB STATE
+    const [uploadForm, setUploadForm] = useState({
+        title: "",
+        genre: "",
+        bpm: "",
+        price: "",
+        description: "",
+    });
+    const [audioFile, setAudioFile] = useState<File | null>(null);
+    const [coverArt, setCoverArt] = useState<File | null>(null);
+    const [isUploading, setIsUploading] = useState(false);
 
     const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
     // REFS (Audio Engine)
     const playersRef = useRef<Map<string, Tone.Player>>(new Map());
+    const channelsRef = useRef<Map<string, Tone.Channel>>(new Map());
     const recorderRef = useRef<Tone.Recorder | null>(null);
     const micRef = useRef<Tone.UserMedia | null>(null);
     const animationFrameRef = useRef<number | null>(null);
+    const metronomeRef = useRef<Tone.Loop | null>(null);
+    const metronomeClickRef = useRef<Tone.MembraneSynth | null>(null);
 
     // Authentication check
     useEffect(() => {
@@ -155,10 +177,21 @@ export default function Studio() {
         recorderRef.current = new Tone.Recorder();
         micRef.current.connect(recorderRef.current);
 
+        // Initialize metronome click sound
+        metronomeClickRef.current = new Tone.MembraneSynth({
+            pitchDecay: 0.008,
+            octaves: 2,
+            envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 }
+        }).toDestination();
+        metronomeClickRef.current.volume.value = -10;
+
         return () => {
             micRef.current?.dispose();
             recorderRef.current?.dispose();
             playersRef.current.forEach(p => p.dispose());
+            channelsRef.current.forEach(c => c.dispose());
+            metronomeRef.current?.dispose();
+            metronomeClickRef.current?.dispose();
             if (animationFrameRef.current) {
                 cancelAnimationFrame(animationFrameRef.current);
             }
@@ -169,6 +202,31 @@ export default function Studio() {
     useEffect(() => {
         Tone.Transport.bpm.value = bpm;
     }, [bpm]);
+
+    // 3. SYNC TRACK STATE TO TONE.JS CHANNELS (Volume, Pan, Mute, Solo)
+    useEffect(() => {
+        tracks.forEach(track => {
+            // Create Channel if missing
+            if (!channelsRef.current.has(track.id)) {
+                const channel = new Tone.Channel({
+                    volume: track.volume,
+                    pan: track.pan,
+                    mute: track.isMuted,
+                    solo: track.isSolo
+                }).toDestination();
+                channelsRef.current.set(track.id, channel);
+            }
+
+            // Update Channel Properties
+            const channel = channelsRef.current.get(track.id);
+            if (channel) {
+                channel.volume.rampTo(track.volume, 0.1);
+                channel.pan.rampTo(track.pan, 0.1);
+                channel.mute = track.isMuted;
+                channel.solo = track.isSolo;
+            }
+        });
+    }, [tracks]);
 
     // Playhead update loop
     const updatePlayhead = useCallback(() => {
@@ -187,7 +245,33 @@ export default function Studio() {
         });
     };
 
-    // 3. PLAYBACK LOGIC
+    // Helper: Toggle metronome
+    const startMetronome = () => {
+        if (metronomeRef.current) {
+            metronomeRef.current.dispose();
+            metronomeRef.current = null;
+        }
+
+        if (isMetronomeOn && metronomeClickRef.current) {
+            // Create a loop that clicks on each beat
+            const loop = new Tone.Loop((time) => {
+                metronomeClickRef.current?.triggerAttackRelease("C5", "32n", time);
+            }, "4n"); // Every quarter note
+            
+            loop.start(0);
+            metronomeRef.current = loop;
+        }
+    };
+
+    const stopMetronome = () => {
+        if (metronomeRef.current) {
+            metronomeRef.current.stop();
+            metronomeRef.current.dispose();
+            metronomeRef.current = null;
+        }
+    };
+
+    // 4. PLAYBACK LOGIC
     const handlePlay = async () => {
         await Tone.start();
 
@@ -195,7 +279,8 @@ export default function Studio() {
             // STOP: Cancel transport and stop all players
             Tone.Transport.stop();
             Tone.Transport.cancel();
-            stopAllPlayers(); // Stop all audio that's currently playing
+            stopAllPlayers();
+            stopMetronome();
             if (animationFrameRef.current) {
                 cancelAnimationFrame(animationFrameRef.current);
             }
@@ -205,15 +290,23 @@ export default function Studio() {
         } else {
             // PLAY: Schedule all clips
             Tone.Transport.cancel();
-            stopAllPlayers(); // Ensure nothing is playing before we start
+            stopAllPlayers();
 
             tracks.forEach(track => {
+                // Skip muted tracks (solo handled by Channel)
                 if (track.isMuted) return;
 
                 track.clips.forEach(clip => {
                     // Create a player if it doesn't exist
                     if (!playersRef.current.has(clip.id)) {
-                        const player = new Tone.Player(clip.url).toDestination();
+                        const player = new Tone.Player(clip.url);
+                        // Connect to the track's mixer channel
+                        const channel = channelsRef.current.get(track.id);
+                        if (channel) {
+                            player.connect(channel);
+                        } else {
+                            player.toDestination(); // Fallback
+                        }
                         playersRef.current.set(clip.id, player);
                     }
 
@@ -226,13 +319,16 @@ export default function Studio() {
                 });
             });
 
+            // Start metronome if enabled
+            startMetronome();
+
             Tone.Transport.start();
             setIsPlaying(true);
             animationFrameRef.current = requestAnimationFrame(updatePlayhead);
         }
     };
 
-    // 4. RECORDING LOGIC
+    // 5. RECORDING LOGIC
     const handleRecord = async () => {
         if (isRecording) {
             // STOP RECORDING
@@ -262,7 +358,8 @@ export default function Studio() {
             // Stop everything
             Tone.Transport.stop();
             Tone.Transport.cancel();
-            stopAllPlayers(); // Stop all audio
+            stopAllPlayers();
+            stopMetronome();
             setIsPlaying(false);
             setIsRecording(false);
             setCurrentTime(0);
@@ -275,9 +372,13 @@ export default function Studio() {
             // START RECORDING
             await Tone.start();
             await micRef.current?.open();
-            stopAllPlayers(); // Ensure nothing is playing
+            stopAllPlayers();
             setRecordStartTime(Tone.Transport.seconds);
             recorderRef.current?.start();
+            
+            // Start metronome if enabled
+            startMetronome();
+            
             Tone.Transport.start();
             setIsPlaying(true);
             setIsRecording(true);
@@ -285,21 +386,31 @@ export default function Studio() {
         }
     };
 
-    // 5. ADD TRACK
+    // 6. ADD TRACK
     const addTrack = () => {
         const newTrack: Track = {
             id: crypto.randomUUID(),
             name: `Track ${tracks.length + 1}`,
             isMuted: false,
+            isSolo: false,
+            volume: 0,
+            pan: 0,
             clips: []
         };
         setTracks([...tracks, newTrack]);
     };
 
-    // 6. TOGGLE MUTE
+    // 7. TOGGLE MUTE
     const toggleMute = (trackId: string) => {
         setTracks(tracks.map(t =>
             t.id === trackId ? { ...t, isMuted: !t.isMuted } : t
+        ));
+    };
+
+    // 8. TOGGLE SOLO
+    const toggleSolo = (trackId: string) => {
+        setTracks(tracks.map(t =>
+            t.id === trackId ? { ...t, isSolo: !t.isSolo } : t
         ));
     };
 
@@ -318,12 +429,13 @@ export default function Studio() {
         }
     };
 
-    // 8. CLEAR ALL
+    // 9. CLEAR ALL
     const clearAll = () => {
         // Stop everything first
         Tone.Transport.stop();
         Tone.Transport.cancel();
         stopAllPlayers();
+        stopMetronome();
         setIsPlaying(false);
         setIsRecording(false);
         if (animationFrameRef.current) {
@@ -332,8 +444,8 @@ export default function Studio() {
         
         // Reset tracks
         setTracks([
-            { id: "1", name: "Beat (Imported)", isMuted: false, clips: [] },
-            { id: "2", name: "Vocals", isMuted: false, clips: [] }
+            { id: "1", name: "Beat", isMuted: false, isSolo: false, volume: -5, pan: 0, clips: [] },
+            { id: "2", name: "Vocals", isMuted: false, isSolo: false, volume: 0, pan: 0, clips: [] }
         ]);
         
         // Dispose all players
@@ -529,7 +641,58 @@ export default function Studio() {
         }
     }, [dragState, handleMouseMove, handleMouseUp]);
 
-    // 12. SAVE AND REDIRECT (update URL after creating new project)
+    // 12. UPLOAD TAB SUBMIT HANDLER
+    const handleUploadSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        const accessToken = localStorage.getItem('accessToken');
+        if (!accessToken) return alert("Please log in first.");
+        if (!audioFile) return alert("Please select an audio file.");
+
+        setIsUploading(true);
+        const formData = new FormData();
+        
+        // Append text fields
+        formData.append('title', uploadForm.title);
+        formData.append('genre', uploadForm.genre);
+        if (uploadForm.bpm) formData.append('bpm', uploadForm.bpm);
+        if (uploadForm.price) formData.append('price', uploadForm.price);
+        formData.append('description', uploadForm.description);
+        
+        // Append files
+        formData.append('audio_file', audioFile);
+        if (coverArt) formData.append('cover_art', coverArt);
+
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/music/tracks/`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    // Note: Do NOT set 'Content-Type' manually when sending FormData
+                },
+                body: formData
+            });
+
+            if (res.ok) {
+                alert("Track uploaded successfully!");
+                // Reset form
+                setUploadForm({ title: "", genre: "", bpm: "", price: "", description: "" });
+                setAudioFile(null);
+                setCoverArt(null);
+                navigate('/');
+            } else {
+                const err = await res.json();
+                console.error(err);
+                alert("Upload failed. Check console for details.");
+            }
+        } catch (error) {
+            console.error(error);
+            alert("Network error.");
+        } finally {
+            setIsUploading(false);
+        }
+    };
+
+    // 13. SAVE AND REDIRECT (update URL after creating new project)
     const saveProjectAndRedirect = async () => {
         const accessToken = localStorage.getItem('accessToken');
         if (!accessToken) {
@@ -674,6 +837,24 @@ export default function Studio() {
 
             {/* Main Content */}
             <div className="flex-1 ml-16 lg:ml-56 flex flex-col h-screen">
+                {/* Tab Switcher */}
+                <div className="bg-gray-900 border-b border-white/10 p-4 flex justify-center gap-4">
+                    <button 
+                        onClick={() => setActiveTab('create')}
+                        className={`px-6 py-2 rounded-full font-bold transition-all ${activeTab === 'create' ? 'bg-purple-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                    >
+                        🎹 Create (DAW)
+                    </button>
+                    <button 
+                        onClick={() => setActiveTab('upload')}
+                        className={`px-6 py-2 rounded-full font-bold transition-all ${activeTab === 'upload' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                    >
+                        ☁️ Upload Existing
+                    </button>
+                </div>
+
+                {activeTab === 'create' ? (
+                <>
                 {/* Top Toolbar */}
                 <div className="bg-gray-900/80 border-b border-white/10 p-4 flex items-center gap-4 flex-wrap">
                     {/* Project Title */}
@@ -721,6 +902,20 @@ export default function Studio() {
                         />
                     </div>
 
+                    {/* Metronome Toggle */}
+                    <button
+                        onClick={() => setIsMetronomeOn(!isMetronomeOn)}
+                        className={`px-4 py-2 rounded-lg font-medium transition-all flex items-center gap-2 ${isMetronomeOn
+                            ? "bg-orange-500 text-white"
+                            : "bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white"
+                            }`}
+                    >
+                        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+                        </svg>
+                        <span className="hidden lg:inline">{isMetronomeOn ? "Metro ON" : "Metro"}</span>
+                    </button>
+
                     {/* Time Display */}
                     <div className="bg-white/5 rounded-lg px-4 py-2 font-mono text-lg">
                         {formatTime(currentTime)}
@@ -757,36 +952,93 @@ export default function Studio() {
 
                 {/* Timeline Area */}
                 <div className="flex-1 flex overflow-hidden">
-                    {/* Track Headers (Left Panel) */}
-                    <div className="w-48 bg-gray-900 border-r border-white/10 flex-shrink-0 overflow-y-auto">
+                    {/* Track Headers (Left Panel) - Mixer */}
+                    <div className="w-52 bg-gray-900 border-r border-white/10 flex-shrink-0 overflow-y-auto">
                         {tracks.map(track => (
                             <div
                                 key={track.id}
                                 onClick={() => setSelectedTrackId(track.id)}
-                                className={`h-24 p-3 border-b border-white/10 cursor-pointer transition-colors ${selectedTrackId === track.id
+                                className={`h-36 p-3 border-b border-white/10 cursor-pointer transition-colors ${selectedTrackId === track.id
                                     ? "bg-purple-900/30 border-l-4 border-l-purple-500"
                                     : "hover:bg-white/5"
                                     }`}
                             >
-                                <div className="font-medium text-sm truncate">{track.name}</div>
-                                <div className="flex items-center gap-2 mt-2">
-                                    <button
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            toggleMute(track.id);
+                                {/* Track Name & Mute/Solo Buttons */}
+                                <div className="flex justify-between items-center mb-2">
+                                    <span className="font-medium text-sm truncate w-24">{track.name}</span>
+                                    <div className="flex gap-1">
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                toggleMute(track.id);
+                                            }}
+                                            className={`text-xs px-2 py-1 rounded font-bold ${track.isMuted
+                                                ? "bg-red-500 text-white"
+                                                : "bg-white/10 text-gray-400 hover:bg-white/20"
+                                                }`}
+                                        >
+                                            M
+                                        </button>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                toggleSolo(track.id);
+                                            }}
+                                            className={`text-xs px-2 py-1 rounded font-bold ${track.isSolo
+                                                ? "bg-yellow-500 text-black"
+                                                : "bg-white/10 text-gray-400 hover:bg-white/20"
+                                                }`}
+                                        >
+                                            S
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* Volume Slider */}
+                                <div className="flex items-center gap-2 mb-1">
+                                    <span className="text-[10px] text-gray-400 w-6">Vol</span>
+                                    <input
+                                        type="range"
+                                        min="-60"
+                                        max="0"
+                                        value={track.volume}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={(e) => {
+                                            const val = Number(e.target.value);
+                                            setTracks(prev => prev.map(t =>
+                                                t.id === track.id ? { ...t, volume: val } : t
+                                            ));
                                         }}
-                                        className={`text-xs px-2 py-1 rounded ${track.isMuted
-                                            ? "bg-red-500 text-white"
-                                            : "bg-white/10 text-gray-400 hover:bg-white/20"
-                                            }`}
-                                    >
-                                        {track.isMuted ? "M" : "M"}
-                                    </button>
-                                    <span className={`text-xs ${track.isMuted ? "text-red-400" : "text-gray-500"}`}>
-                                        {track.isMuted ? "Muted" : "Active"}
+                                        className="flex-1 h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                                    />
+                                    <span className="text-[10px] text-gray-500 w-8 text-right">{track.volume}dB</span>
+                                </div>
+
+                                {/* Pan Slider */}
+                                <div className="flex items-center gap-2 mb-1">
+                                    <span className="text-[10px] text-gray-400 w-6">Pan</span>
+                                    <input
+                                        type="range"
+                                        min="-1"
+                                        max="1"
+                                        step="0.1"
+                                        value={track.pan}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={(e) => {
+                                            const val = Number(e.target.value);
+                                            setTracks(prev => prev.map(t =>
+                                                t.id === track.id ? { ...t, pan: val } : t
+                                            ));
+                                        }}
+                                        className="flex-1 h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                                    />
+                                    <span className="text-[10px] text-gray-500 w-8 text-right">
+                                        {track.pan === 0 ? 'C' : track.pan < 0 ? `L${Math.abs(track.pan * 100).toFixed(0)}` : `R${(track.pan * 100).toFixed(0)}`}
                                     </span>
                                 </div>
-                                <div className="text-xs text-gray-500 mt-1">
+
+                                {/* Clip count */}
+                                <div className="text-[10px] text-gray-500">
                                     {track.clips.length} clip{track.clips.length !== 1 ? 's' : ''}
                                 </div>
                             </div>
@@ -826,7 +1078,7 @@ export default function Studio() {
                         {tracks.map(track => (
                             <div
                                 key={track.id}
-                                className={`h-24 border-b border-white/5 relative ${track.isMuted ? 'opacity-50' : ''
+                                className={`h-36 border-b border-white/5 relative ${track.isMuted ? 'opacity-50' : ''
                                     } ${selectedTrackId === track.id ? 'bg-purple-900/10' : ''}`}
                                 style={{ minWidth: `${60 * PX_PER_SEC}px` }}
                             >
@@ -915,6 +1167,126 @@ export default function Studio() {
                         <span>Zoom: {PX_PER_SEC}px/sec</span>
                     </div>
                 </div>
+                </>
+                ) : (
+                /* ================= UPLOAD UI ================= */
+                <div className="flex-1 bg-gray-950 overflow-y-auto p-8 flex justify-center">
+                    <div className="w-full max-w-2xl bg-gray-900 border border-white/10 rounded-2xl p-8 shadow-2xl">
+                        <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                            📤 Upload Track
+                            <span className="text-sm font-normal text-gray-400 bg-gray-800 px-2 py-1 rounded">MP3 / WAV</span>
+                        </h2>
+                        
+                        <form onSubmit={handleUploadSubmit} className="space-y-6">
+                            {/* File Inputs */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-medium text-gray-300">Audio File *</label>
+                                    <input 
+                                        type="file" 
+                                        accept="audio/*"
+                                        onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
+                                        className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-500"
+                                        required
+                                    />
+                                    {audioFile && <p className="text-xs text-green-400">Selected: {audioFile.name}</p>}
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-medium text-gray-300">Cover Art</label>
+                                    <input 
+                                        type="file" 
+                                        accept="image/*"
+                                        onChange={(e) => setCoverArt(e.target.files?.[0] || null)}
+                                        className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gray-700 file:text-white hover:file:bg-gray-600"
+                                    />
+                                    {coverArt && <p className="text-xs text-green-400">Selected: {coverArt.name}</p>}
+                                </div>
+                            </div>
+
+                            {/* Metadata Inputs */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-medium text-gray-300">Track Title *</label>
+                                    <input 
+                                        type="text" 
+                                        value={uploadForm.title}
+                                        onChange={(e) => setUploadForm({...uploadForm, title: e.target.value})}
+                                        className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                        placeholder="e.g. Midnight Vibes"
+                                        required
+                                    />
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-medium text-gray-300">Genre</label>
+                                    <select 
+                                        value={uploadForm.genre}
+                                        onChange={(e) => setUploadForm({...uploadForm, genre: e.target.value})}
+                                        className="w-full bg-gray-800 text-white border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                    >
+                                        <option value="" className="bg-gray-800 text-white">Select Genre</option>
+                                        <option value="Hip Hop" className="bg-gray-800 text-white">Hip Hop</option>
+                                        <option value="Trap" className="bg-gray-800 text-white">Trap</option>
+                                        <option value="R&B" className="bg-gray-800 text-white">R&B</option>
+                                        <option value="Pop" className="bg-gray-800 text-white">Pop</option>
+                                        <option value="Electronic" className="bg-gray-800 text-white">Electronic</option>
+                                        <option value="Rock" className="bg-gray-800 text-white">Rock</option>
+                                        <option value="Jazz" className="bg-gray-800 text-white">Jazz</option>
+                                        <option value="Classical" className="bg-gray-800 text-white">Classical</option>
+                                        <option value="Other" className="bg-gray-800 text-white">Other</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-medium text-gray-300">BPM</label>
+                                    <input 
+                                        type="number" 
+                                        value={uploadForm.bpm}
+                                        onChange={(e) => setUploadForm({...uploadForm, bpm: e.target.value})}
+                                        className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                        placeholder="120"
+                                        min={40}
+                                        max={300}
+                                    />
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-medium text-gray-300">Price ($)</label>
+                                    <input 
+                                        type="number" 
+                                        step="0.01"
+                                        value={uploadForm.price}
+                                        onChange={(e) => setUploadForm({...uploadForm, price: e.target.value})}
+                                        className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                        placeholder="29.99"
+                                        min={0}
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="space-y-2">
+                                <label className="block text-sm font-medium text-gray-300">Description</label>
+                                <textarea 
+                                    value={uploadForm.description}
+                                    onChange={(e) => setUploadForm({...uploadForm, description: e.target.value})}
+                                    className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500 h-24 resize-none"
+                                    placeholder="Tell us about your track..."
+                                />
+                            </div>
+
+                            <button 
+                                type="submit" 
+                                disabled={isUploading}
+                                className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition-all transform hover:scale-[1.01] ${
+                                    isUploading ? "bg-gray-600 cursor-not-allowed" : "bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500"
+                                }`}
+                            >
+                                {isUploading ? "Uploading..." : "🚀 Publish to Market"}
+                            </button>
+                        </form>
+                    </div>
+                </div>
+                )}
             </div>
         </div>
     );
