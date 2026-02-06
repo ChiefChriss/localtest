@@ -218,8 +218,7 @@ export default function Studio() {
                 if (!playersRef.current.has(clip.id)) {
                     const buffer = buffersRef.current.get(clip.id);
                     
-                    // Use buffer if available (for newly imported/recorded clips)
-                    // Otherwise fallback to URL (for clips loaded from saved projects)
+                    // Use buffer if available (CRITICAL for recordings)
                     const player = buffer 
                         ? new Tone.Player(buffer) 
                         : new Tone.Player(clip.url);
@@ -229,6 +228,14 @@ export default function Studio() {
                 }
             });
         });
+
+        // CLEANUP FUNCTION
+        return () => {
+            // Dispose all players to free memory
+            playersRef.current.forEach(p => p.dispose());
+            // CRITICAL FIX: Clear the map so they are recreated on next render
+            playersRef.current.clear();
+        };
     }, [tracks, bpm]);
 
     // --- 4. PLAYBACK CONTROLS ---
@@ -263,23 +270,23 @@ export default function Studio() {
                 const channel = channelsRef.current.get(track.id);
 
                 track.clips.forEach(clip => {
-                    // Create a new player if one doesn't exist
                     let player = playersRef.current.get(clip.id);
+                    
+                    // Fallback: If player missing, recreate it correctly using BUFFER if available
                     if (!player) {
-                        player = new Tone.Player(clip.url).connect(channel!);
+                        const buffer = buffersRef.current.get(clip.id);
+                        player = buffer 
+                            ? new Tone.Player(buffer).connect(channel!) 
+                            : new Tone.Player(clip.url).connect(channel!);
                         playersRef.current.set(clip.id, player);
                     }
 
-                    // Wait for the buffer to load
+                    // Schedule playback
                     if (player.loaded) {
-                        // Disconnect and reconnect to ensure it goes to the right channel
                         player.disconnect();
                         player.connect(channel!);
-
-                        // Schedule
                         player.sync().start(clip.startTime, 0, clip.duration);
                     } else {
-                        // If not loaded, try to load and then sync
                         player.load(clip.url).then(() => {
                             player!.disconnect();
                             player!.connect(channel!);
