@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import * as Tone from "tone";
 import Logo from './components/Logo';
@@ -7,6 +7,7 @@ import { generateWaveform } from './utils/waveform';
 // --- CONSTANTS ---
 const PX_PER_SEC = 50;
 const SNAP_GRID = 0.25; // Snap to quarter notes
+const SUPPORTED_FORMATS = '.mp3,.wav,audio/mpeg,audio/wav,audio/wave,audio/x-wav';
 
 interface Clip {
     id: string;
@@ -34,6 +35,153 @@ interface ProjectSummary {
     title: string;
     bpm: number;
     last_updated: string;
+}
+
+// --- AUDIO ENGINE CLASS (Native Web Audio API) ---
+class AudioEngine {
+    private ctx: AudioContext | null = null;
+    private buffers: Map<string, AudioBuffer> = new Map();
+    private activeNodes: Map<string, { source: AudioBufferSourceNode; gain: GainNode; pan: StereoPannerNode }> = new Map();
+    private masterGain: GainNode | null = null;
+    
+    async init(): Promise<void> {
+        if (!this.ctx) {
+            this.ctx = new AudioContext();
+            this.masterGain = this.ctx.createGain();
+            this.masterGain.connect(this.ctx.destination);
+        }
+        if (this.ctx.state === 'suspended') {
+            await this.ctx.resume();
+        }
+    }
+
+    getContext(): AudioContext | null {
+        return this.ctx;
+    }
+
+    async loadBuffer(clipId: string, url: string): Promise<AudioBuffer | null> {
+        if (this.buffers.has(clipId)) {
+            return this.buffers.get(clipId)!;
+        }
+        
+        try {
+            await this.init();
+            const response = await fetch(url);
+            const arrayBuffer = await response.arrayBuffer();
+            const audioBuffer = await this.ctx!.decodeAudioData(arrayBuffer);
+            this.buffers.set(clipId, audioBuffer);
+            return audioBuffer;
+        } catch (err) {
+            console.error(`Failed to load audio: ${url}`, err);
+            return null;
+        }
+    }
+
+    setBuffer(clipId: string, buffer: AudioBuffer): void {
+        this.buffers.set(clipId, buffer);
+    }
+
+    getBuffer(clipId: string): AudioBuffer | undefined {
+        return this.buffers.get(clipId);
+    }
+
+    playClip(
+        clipId: string,
+        startOffset: number,
+        duration: number,
+        volume: number,
+        pan: number,
+        when: number = 0
+    ): void {
+        if (!this.ctx || !this.masterGain) return;
+        
+        const buffer = this.buffers.get(clipId);
+        if (!buffer) return;
+
+        // Stop if already playing
+        this.stopClip(clipId);
+
+        // Create audio nodes
+        const source = this.ctx.createBufferSource();
+        const gainNode = this.ctx.createGain();
+        const panNode = this.ctx.createStereoPanner();
+
+        // Configure nodes
+        source.buffer = buffer;
+        gainNode.gain.value = this.dbToLinear(volume);
+        panNode.pan.value = Math.max(-1, Math.min(1, pan));
+
+        // Connect chain: source -> gain -> pan -> master
+        source.connect(gainNode);
+        gainNode.connect(panNode);
+        panNode.connect(this.masterGain);
+
+        // Store for later control
+        this.activeNodes.set(clipId, { source, gain: gainNode, pan: panNode });
+
+        // Play with timing
+        const playOffset = Math.max(0, startOffset);
+        const playDuration = Math.min(duration, buffer.duration - playOffset);
+        
+        source.start(this.ctx.currentTime + when, playOffset, playDuration);
+        
+        // Auto-cleanup when finished
+        source.onended = () => {
+            this.activeNodes.delete(clipId);
+        };
+    }
+
+    stopClip(clipId: string): void {
+        const nodes = this.activeNodes.get(clipId);
+        if (nodes) {
+            try {
+                nodes.source.stop();
+                nodes.source.disconnect();
+                nodes.gain.disconnect();
+                nodes.pan.disconnect();
+            } catch (e) {
+                // Already stopped
+            }
+            this.activeNodes.delete(clipId);
+        }
+    }
+
+    stopAll(): void {
+        this.activeNodes.forEach((_, clipId) => this.stopClip(clipId));
+    }
+
+    updateClipVolume(clipId: string, volume: number): void {
+        const nodes = this.activeNodes.get(clipId);
+        if (nodes) {
+            nodes.gain.gain.setValueAtTime(this.dbToLinear(volume), this.ctx!.currentTime);
+        }
+    }
+
+    updateClipPan(clipId: string, pan: number): void {
+        const nodes = this.activeNodes.get(clipId);
+        if (nodes) {
+            nodes.pan.pan.setValueAtTime(Math.max(-1, Math.min(1, pan)), this.ctx!.currentTime);
+        }
+    }
+
+    removeBuffer(clipId: string): void {
+        this.buffers.delete(clipId);
+        this.stopClip(clipId);
+    }
+
+    private dbToLinear(db: number): number {
+        if (db <= -60) return 0;
+        return Math.pow(10, db / 20);
+    }
+
+    dispose(): void {
+        this.stopAll();
+        this.buffers.clear();
+        if (this.ctx) {
+            this.ctx.close();
+            this.ctx = null;
+        }
+    }
 }
 
 export default function Studio() {
@@ -81,20 +229,24 @@ export default function Studio() {
     const [isUploading, setIsUploading] = useState(false);
 
     // --- REFS ---
-    const playersRef = useRef<Map<string, Tone.Player>>(new Map());
-    const channelsRef = useRef<Map<string, Tone.Channel>>(new Map());
-    const buffersRef = useRef<Map<string, Tone.ToneAudioBuffer>>(new Map()); // Store audio buffers for instant playback
+    const audioEngineRef = useRef<AudioEngine>(new AudioEngine());
     const recorderRef = useRef<Tone.Recorder | null>(null);
     const micRef = useRef<Tone.UserMedia | null>(null);
     const animationFrameRef = useRef<number | null>(null);
     const timelineRef = useRef<HTMLDivElement>(null);
+    const playbackStartTimeRef = useRef<number>(0);
+    const playbackOffsetRef = useRef<number>(0);
 
     // --- 1. INITIALIZATION & AUTH ---
     useEffect(() => {
         const initEngine = async () => {
+            // Initialize recording (Tone.js for mic input only)
             micRef.current = new Tone.UserMedia();
             recorderRef.current = new Tone.Recorder();
             micRef.current.connect(recorderRef.current);
+            
+            // Initialize playback engine
+            await audioEngineRef.current.init();
         };
         initEngine();
 
@@ -136,8 +288,7 @@ export default function Studio() {
         return () => {
             micRef.current?.dispose();
             recorderRef.current?.dispose();
-            playersRef.current.forEach(p => p.dispose());
-            channelsRef.current.forEach(c => c.dispose());
+            audioEngineRef.current.dispose();
             if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
         };
     }, [navigate, API_BASE_URL, id]);
@@ -197,131 +348,112 @@ export default function Studio() {
         } catch (e) { console.error(e); }
     };
 
-    // --- 3. AUDIO ENGINE SYNC (Channels only - Players created on demand) ---
+    // --- 3. AUDIO BUFFER PRELOADING ---
     useEffect(() => {
-        Tone.Transport.bpm.value = bpm;
-
-        tracks.forEach(track => {
-            // Create/Update Channel (Volume/Pan)
-            if (!channelsRef.current.has(track.id)) {
-                const channel = new Tone.Channel({ volume: track.volume, pan: track.pan, mute: track.isMuted, solo: track.isSolo }).toDestination();
-                channelsRef.current.set(track.id, channel);
-            }
-            const channel = channelsRef.current.get(track.id)!;
-            channel.volume.rampTo(track.volume, 0.1);
-            channel.pan.rampTo(track.pan, 0.1);
-            channel.mute = track.isMuted;
-            channel.solo = track.isSolo;
-
-            // Pre-load players (use stored buffer if available for instant playback)
-            track.clips.forEach(clip => {
-                if (!playersRef.current.has(clip.id)) {
-                    const buffer = buffersRef.current.get(clip.id);
-                    
-                    // Use buffer if available (CRITICAL for recordings)
-                    const player = buffer 
-                        ? new Tone.Player(buffer) 
-                        : new Tone.Player(clip.url);
-                    
-                    player.connect(channel);
-                    playersRef.current.set(clip.id, player);
+        const preloadBuffers = async () => {
+            const engine = audioEngineRef.current;
+            
+            for (const track of tracks) {
+                for (const clip of track.clips) {
+                    // Only load if not already cached
+                    if (!engine.getBuffer(clip.id)) {
+                        await engine.loadBuffer(clip.id, clip.url);
+                    }
                 }
-            });
-        });
-
-        // CLEANUP FUNCTION
-        return () => {
-            // Dispose all players to free memory
-            playersRef.current.forEach(p => p.dispose());
-            // CRITICAL FIX: Clear the map so they are recreated on next render
-            playersRef.current.clear();
+            }
         };
-    }, [tracks, bpm]);
+        
+        preloadBuffers();
+    }, [tracks]);
 
     // --- 4. PLAYBACK CONTROLS ---
+    const updatePlayhead = useCallback(() => {
+        if (!isPlaying) return;
+        
+        const ctx = audioEngineRef.current.getContext();
+        if (!ctx) return;
+        
+        const elapsed = ctx.currentTime - playbackStartTimeRef.current;
+        const newTime = playbackOffsetRef.current + elapsed;
+        
+        setCurrentTime(newTime);
+        animationFrameRef.current = requestAnimationFrame(updatePlayhead);
+    }, [isPlaying]);
+
     const handlePlay = async () => {
-        await Tone.start();
+        const engine = audioEngineRef.current;
+        await engine.init();
 
         if (isPlaying) {
-            // Pause
-            Tone.Transport.pause();
-            playersRef.current.forEach(p => {
-                try { p.stop(); } catch (e) { }
-            });
+            // Pause - stop all clips and save current position
+            engine.stopAll();
+            if (animationFrameRef.current) {
+                cancelAnimationFrame(animationFrameRef.current);
+            }
+            playbackOffsetRef.current = currentTime;
             setIsPlaying(false);
         } else {
-            // Stop any existing playback first
-            Tone.Transport.stop();
-            Tone.Transport.cancel();
-            playersRef.current.forEach(p => {
-                try {
-                    p.stop();
-                    p.unsync();
-                } catch (e) { }
-            });
+            // Play from current position
+            engine.stopAll();
+            
+            const ctx = engine.getContext();
+            if (!ctx) return;
+            
+            playbackStartTimeRef.current = ctx.currentTime;
+            const startPosition = playbackOffsetRef.current;
 
-            // Wait for all audio to load
-            await Tone.loaded();
+            // Check if any track has solo enabled
+            const hasSolo = tracks.some(t => t.isSolo);
 
-            // Schedule all clips on Transport
-            tracks.forEach(track => {
-                if (track.isMuted) return;
+            // Schedule all clips
+            for (const track of tracks) {
+                // Skip muted tracks, or non-solo tracks if any track is soloed
+                if (track.isMuted) continue;
+                if (hasSolo && !track.isSolo) continue;
 
-                const channel = channelsRef.current.get(track.id);
-
-                track.clips.forEach(clip => {
-                    let player = playersRef.current.get(clip.id);
+                for (const clip of track.clips) {
+                    const clipEnd = clip.startTime + clip.duration;
                     
-                    // Fallback: If player missing, recreate it correctly using BUFFER if available
-                    if (!player) {
-                        const buffer = buffersRef.current.get(clip.id);
-                        player = buffer 
-                            ? new Tone.Player(buffer).connect(channel!) 
-                            : new Tone.Player(clip.url).connect(channel!);
-                        playersRef.current.set(clip.id, player);
+                    // Skip clips that have already finished
+                    if (clipEnd <= startPosition) continue;
+                    
+                    // Load buffer if needed
+                    let buffer = engine.getBuffer(clip.id);
+                    if (!buffer) {
+                        buffer = await engine.loadBuffer(clip.id, clip.url);
+                        if (!buffer) continue;
                     }
 
-                    // Schedule playback
-                    if (player.loaded) {
-                        player.disconnect();
-                        player.connect(channel!);
-                        player.sync().start(clip.startTime, 0, clip.duration);
+                    // Calculate when to start this clip relative to current playback position
+                    if (startPosition >= clip.startTime) {
+                        // Already in the middle of this clip - play immediately with offset
+                        const offset = startPosition - clip.startTime;
+                        const remaining = clip.duration - offset;
+                        engine.playClip(clip.id, offset, remaining, track.volume, track.pan, 0);
                     } else {
-                        player.load(clip.url).then(() => {
-                            player!.disconnect();
-                            player!.connect(channel!);
-                            player!.sync().start(clip.startTime, 0, clip.duration);
-                        });
+                        // Clip hasn't started yet - schedule it
+                        const delay = clip.startTime - startPosition;
+                        engine.playClip(clip.id, 0, clip.duration, track.volume, track.pan, delay);
                     }
-                });
-            });
+                }
+            }
 
-            // Start playback
-            Tone.Transport.start();
             setIsPlaying(true);
-            requestAnimationFrame(updatePlayhead);
+            animationFrameRef.current = requestAnimationFrame(updatePlayhead);
         }
     };
 
     const handleStop = () => {
-        Tone.Transport.stop();
-        Tone.Transport.cancel();
-        Tone.Transport.seconds = 0;
-        playersRef.current.forEach(p => {
-            try {
-                p.stop();
-                p.unsync();
-            } catch (e) { }
-        });
+        const engine = audioEngineRef.current;
+        engine.stopAll();
+        
+        if (animationFrameRef.current) {
+            cancelAnimationFrame(animationFrameRef.current);
+        }
+        
+        playbackOffsetRef.current = 0;
         setIsPlaying(false);
         setCurrentTime(0);
-    };
-
-    const updatePlayhead = () => {
-        setCurrentTime(Tone.Transport.seconds);
-        if (Tone.Transport.state === "started") {
-            animationFrameRef.current = requestAnimationFrame(updatePlayhead);
-        }
     };
 
     // --- 5. DRAG & DROP HANDLERS (VISUAL ONLY - Prevents 60fps re-renders) ---
@@ -413,71 +545,106 @@ export default function Studio() {
     // --- 6. RECORDING ---
     const handleRecord = async () => {
         if (isRecording) {
+            // Stop recording
             const blob = await recorderRef.current?.stop();
             if (blob) {
                 const url = URL.createObjectURL(blob);
-                const buffer = await new Tone.ToneAudioBuffer().load(url);
-                const waveData = await generateWaveform(url, 100);
-
-                // Generate ID first so we can store buffer with matching ID
-                const clipId = crypto.randomUUID();
+                const engine = audioEngineRef.current;
                 
-                // Store buffer for instant playback (avoids blob URL loading issues)
-                buffersRef.current.set(clipId, buffer);
+                // Load into native AudioBuffer
+                const buffer = await engine.loadBuffer(crypto.randomUUID(), url);
+                if (buffer) {
+                    const waveData = await generateWaveform(url, 100);
+                    const clipId = crypto.randomUUID();
+                    
+                    // Store buffer in engine
+                    engine.setBuffer(clipId, buffer);
 
-                const newClip: Clip = {
-                    id: clipId,
-                    url,
-                    name: "Rec " + (tracks.find(t => t.id === selectedTrackId)?.clips.length || 0 + 1),
-                    startTime: Math.max(0, Tone.Transport.seconds - buffer.duration),
-                    duration: buffer.duration,
-                    waveformData: waveData,
-                    color: "bg-red-500"
-                };
-                setTracks(prev => prev.map(t => t.id === selectedTrackId ? { ...t, clips: [...t.clips, newClip] } : t));
+                    const newClip: Clip = {
+                        id: clipId,
+                        url,
+                        name: "Rec " + ((tracks.find(t => t.id === selectedTrackId)?.clips.length || 0) + 1),
+                        startTime: Math.max(0, currentTime - buffer.duration),
+                        duration: buffer.duration,
+                        waveformData: waveData,
+                        color: "bg-red-500"
+                    };
+                    setTracks(prev => prev.map(t => t.id === selectedTrackId ? { ...t, clips: [...t.clips, newClip] } : t));
+                }
             }
-            setIsPlaying(false);
+            
+            // Stop playback and recording
+            handleStop();
             setIsRecording(false);
-            Tone.Transport.stop();
         } else {
+            // Start recording
             await Tone.start();
+            await audioEngineRef.current.init();
             await micRef.current?.open();
             recorderRef.current?.start();
-            Tone.Transport.start();
+            
+            // Start playhead animation
+            const ctx = audioEngineRef.current.getContext();
+            if (ctx) {
+                playbackStartTimeRef.current = ctx.currentTime;
+            }
             setIsPlaying(true);
             setIsRecording(true);
-            requestAnimationFrame(updatePlayhead);
+            animationFrameRef.current = requestAnimationFrame(updatePlayhead);
         }
     };
 
-    // --- 7. IMPORT AUDIO ---
+    // --- 7. IMPORT AUDIO (MP3 & WAV) ---
     const handleImportAudio = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
 
-        const url = URL.createObjectURL(file);
-        const buffer = await new Tone.ToneAudioBuffer().load(url);
-        const waveData = await generateWaveform(url, 100);
-
-        // Generate ID first so we can store buffer with matching ID
-        const clipId = crypto.randomUUID();
+        // Validate file type
+        const validTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/wave', 'audio/x-wav'];
+        const isValidType = validTypes.includes(file.type) || 
+                           file.name.toLowerCase().endsWith('.mp3') || 
+                           file.name.toLowerCase().endsWith('.wav');
         
-        // Store buffer for instant playback (avoids blob URL loading issues)
-        buffersRef.current.set(clipId, buffer);
+        if (!isValidType) {
+            alert('Please select an MP3 or WAV file.');
+            e.target.value = '';
+            return;
+        }
 
-        const newClip: Clip = {
-            id: clipId,
-            url,
-            startTime: 0,
-            duration: buffer.duration,
-            name: file.name,
-            waveformData: waveData,
-            color: "bg-blue-500"
-        };
+        try {
+            const url = URL.createObjectURL(file);
+            const engine = audioEngineRef.current;
+            await engine.init();
+            
+            // Load into native AudioBuffer
+            const clipId = crypto.randomUUID();
+            const buffer = await engine.loadBuffer(clipId, url);
+            
+            if (!buffer) {
+                alert('Failed to load audio file. Please try a different file.');
+                e.target.value = '';
+                return;
+            }
 
-        setTracks(prev => prev.map(t =>
-            t.id === selectedTrackId ? { ...t, clips: [...t.clips, newClip] } : t
-        ));
+            const waveData = await generateWaveform(url, 100);
+
+            const newClip: Clip = {
+                id: clipId,
+                url,
+                startTime: 0,
+                duration: buffer.duration,
+                name: file.name.replace(/\.(mp3|wav)$/i, ''),
+                waveformData: waveData,
+                color: "bg-blue-500"
+            };
+
+            setTracks(prev => prev.map(t =>
+                t.id === selectedTrackId ? { ...t, clips: [...t.clips, newClip] } : t
+            ));
+        } catch (err) {
+            console.error('Import error:', err);
+            alert('Failed to import audio file.');
+        }
 
         e.target.value = '';
     };
@@ -577,20 +744,18 @@ export default function Studio() {
 
     // --- 9. CLEAR ALL ---
     const clearAll = () => {
-        Tone.Transport.stop();
-        setIsPlaying(false);
+        handleStop();
         setIsRecording(false);
 
+        // Clean up blob URLs
         tracks.forEach(track => {
             track.clips.forEach(clip => {
                 if (clip.url.startsWith('blob:')) {
                     URL.revokeObjectURL(clip.url);
                 }
+                audioEngineRef.current.removeBuffer(clip.id);
             });
         });
-
-        playersRef.current.forEach(p => p.dispose());
-        playersRef.current.clear();
 
         setTracks([
             { id: "1", name: "Beat", isMuted: false, isSolo: false, volume: -6, pan: 0, clips: [] },
@@ -604,18 +769,21 @@ export default function Studio() {
     useEffect(() => {
         const handleKey = (e: KeyboardEvent) => {
             if ((e.key === 'Delete' || e.key === 'Backspace') && selectedClipId) {
-                // Revoke blob URL
-                for (const track of tracks) {
-                    const clip = track.clips.find(c => c.id === selectedClipId);
-                    if (clip && clip.url.startsWith('blob:')) {
-                        URL.revokeObjectURL(clip.url);
-                    }
+                // Don't delete if user is typing in an input
+                if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+                    return;
                 }
 
-                // Dispose player
-                const player = playersRef.current.get(selectedClipId);
-                player?.dispose();
-                playersRef.current.delete(selectedClipId);
+                // Revoke blob URL and remove buffer
+                for (const track of tracks) {
+                    const clip = track.clips.find(c => c.id === selectedClipId);
+                    if (clip) {
+                        if (clip.url.startsWith('blob:')) {
+                            URL.revokeObjectURL(clip.url);
+                        }
+                        audioEngineRef.current.removeBuffer(clip.id);
+                    }
+                }
 
                 setTracks(prev => prev.map(t => ({ ...t, clips: t.clips.filter(c => c.id !== selectedClipId) })));
                 setSelectedClipId(null);
@@ -735,7 +903,7 @@ export default function Studio() {
                             </button>
                             <label className="text-xs text-gray-300 hover:text-white flex items-center gap-1 cursor-pointer">
                                 📁 Import
-                                <input type="file" accept="audio/*" onChange={handleImportAudio} className="hidden" />
+                                <input type="file" accept={SUPPORTED_FORMATS} onChange={handleImportAudio} className="hidden" />
                             </label>
                             <button onClick={clearAll} className="text-xs text-gray-300 hover:text-white">🗑 Clear</button>
                         </>
